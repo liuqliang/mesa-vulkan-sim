@@ -38,9 +38,22 @@ class Intersection_Table_Type(Enum):
 
 intersection_table_type = Intersection_Table_Type.Baseline
 
+RTCORE_BOOTSTRAP_CONTEXT_BASE = 0x10000000
+RTCORE_CONTEXT_BYTES = 0x280
+RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE = 0x20000000
+RTCORE_HANDOFF_WINDOW_SLOT_BYTES = 0x80
+
 
 def rtcore_symbolic_submit_enabled():
     return os.environ.get('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT', '0') == '1'
+
+
+def rtcore_bootstrap_context_ptr(trace_ray_id):
+    return str(RTCORE_BOOTSTRAP_CONTEXT_BASE + trace_ray_id * RTCORE_CONTEXT_BYTES)
+
+
+def rtcore_bootstrap_handoff_window_base(trace_ray_id):
+    return str(RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE + trace_ray_id * RTCORE_HANDOFF_WINDOW_SLOT_BYTES)
 
 
 def vector_suffix_letter(x):
@@ -440,11 +453,11 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             context_ptr_init = PTXFunctionalLine()
             context_ptr_init.leadingWhiteSpace = line.leadingWhiteSpace
-            context_ptr_init.buildString('mov.b64', (context_ptr_reg, '0'))
+            context_ptr_init.buildString('mov.b64', (context_ptr_reg, rtcore_bootstrap_context_ptr(trace_ray_ID)))
 
             handoff_window_base_init = PTXFunctionalLine()
             handoff_window_base_init.leadingWhiteSpace = line.leadingWhiteSpace
-            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, '0'))
+            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_bootstrap_handoff_window_base(trace_ray_ID)))
 
             trace_submit_setup = [
                 context_ptr_declaration,
