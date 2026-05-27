@@ -842,6 +842,16 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         end_trace_ray.leadingWhiteSpace = line.leadingWhiteSpace
         end_trace_ray.buildString(FunctionalType.end_trace_ray, ())
 
+        trace_retire = []
+        if symbolic_rt_submit:
+            retire_context = PTXFunctionalLine()
+            retire_context.leadingWhiteSpace = line.leadingWhiteSpace
+            retire_context.buildString(
+                FunctionalType.rt_retire_context,
+                (context_ptr_reg, handoff_window_base_reg),
+            )
+            trace_retire.append(retire_context)
+
         newLines = [traversal_finished_declaration]
         newLines.extend(trace_submit_setup)
         newLines.extend([line, PTXLine('\n')])
@@ -853,6 +863,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         newLines.extend(closest_hit_lines)
         newLines.append(PTXLine('\n'))
         newLines.extend([call_miss_bra, call_miss, skip_miss_label, PTXLine('\n'), end_trace_ray])
+        newLines.extend(trace_retire)
 
 
         ptx_shader.lines[index:index + 1] = newLines
