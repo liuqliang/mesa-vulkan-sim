@@ -439,6 +439,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         args[8:9] = directionRegNames[:3]
         args[6:7] = originRegNames[:3]
         args.append(traversal_finished_reg)
+        trace_ray_lines = [line]
         if symbolic_rt_submit:
             context_ptr_reg = '%rt_context_ptr_' + str(trace_ray_ID)
             handoff_window_base_reg = '%rt_handoff_window_base_' + str(trace_ray_ID)
@@ -465,7 +466,17 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 context_ptr_init,
                 handoff_window_base_init,
             ]
-            line.buildString(FunctionalType.rt_submit, (traversal_finished_reg, context_ptr_reg, handoff_window_base_reg))
+            trace_ray_line = PTXFunctionalLine()
+            trace_ray_line.leadingWhiteSpace = line.leadingWhiteSpace
+            trace_ray_line.buildString(line.functionalType, args)
+
+            rt_submit_line = PTXFunctionalLine()
+            rt_submit_line.leadingWhiteSpace = line.leadingWhiteSpace
+            rt_submit_line.buildString(
+                FunctionalType.rt_submit,
+                (traversal_finished_reg, context_ptr_reg, handoff_window_base_reg),
+            )
+            trace_ray_lines = [trace_ray_line, rt_submit_line]
         else:
             line.buildString(line.functionalType, args)
 
@@ -854,7 +865,8 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
         newLines = [traversal_finished_declaration]
         newLines.extend(trace_submit_setup)
-        newLines.extend([line, PTXLine('\n')])
+        newLines.extend(trace_ray_lines)
+        newLines.append(PTXLine('\n'))
         newLines.extend(intersection_lines)
         newLines.append(PTXLine('\n'))
         newLines.extend(anyhit_lines)
