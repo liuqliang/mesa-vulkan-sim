@@ -51,12 +51,29 @@ def rtcore_symbolic_submit_enabled():
     return os.environ.get('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT', '0') == '1'
 
 
+def rtcore_parse_int_env(name, fallback):
+    value = os.environ.get(name)
+    if value is None or value == '':
+        return fallback
+    try:
+        return int(value, 0)
+    except ValueError:
+        return fallback
+
+
 def rtcore_bootstrap_context_base(trace_ray_id):
     return str(RTCORE_BOOTSTRAP_CONTEXT_BASE + trace_ray_id * RTCORE_CONTEXT_WARP_BYTES)
 
 
+def rtcore_symbolic_handoff_window_base():
+    return rtcore_parse_int_env(
+        'VULKAN_SIM_RTCORE_SYMBOLIC_HANDOFF_WINDOW_BASE',
+        RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE,
+    )
+
+
 def rtcore_bootstrap_handoff_window_base(trace_ray_id):
-    return str(RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE + trace_ray_id * RTCORE_HANDOFF_WINDOW_WARP_BYTES)
+    return str(rtcore_symbolic_handoff_window_base() + trace_ray_id * RTCORE_HANDOFF_WINDOW_WARP_BYTES)
 
 
 def vector_suffix_letter(x):
