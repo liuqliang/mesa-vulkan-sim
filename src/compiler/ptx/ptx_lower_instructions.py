@@ -39,6 +39,10 @@ class Intersection_Table_Type(Enum):
 intersection_table_type = Intersection_Table_Type.Baseline
 
 
+def rtcore_symbolic_submit_enabled():
+    return os.environ.get('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT', '0') == '1'
+
+
 def vector_suffix_letter(x):
     if x == 0:
         return 'x'
@@ -406,6 +410,8 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         traversal_finished_declaration.leadingWhiteSpace = line.leadingWhiteSpace
         traversal_finished_declaration.buildString(DeclarationType.Register, None, '.u32', traversal_finished_reg)
 
+        symbolic_rt_submit = rtcore_symbolic_submit_enabled()
+        trace_submit_setup = []
 
         topLevelAS, rayFlags, cullMask, sbtRecordOffset, sbtRecordStride, missIndex, origin, Tmin, direction, Tmax, payload = line.args
         line.args = line.args[:-1] # MRS_TODO: why there is a payload (in glsl code it is NULL but translated to ssa_88)? and why it gets an error to run?
@@ -420,7 +426,35 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         args[8:9] = directionRegNames[:3]
         args[6:7] = originRegNames[:3]
         args.append(traversal_finished_reg)
-        line.buildString(line.functionalType, args)
+        if symbolic_rt_submit:
+            context_ptr_reg = '%rt_context_ptr_' + str(trace_ray_ID)
+            handoff_window_base_reg = '%rt_handoff_window_base_' + str(trace_ray_ID)
+
+            context_ptr_declaration = PTXDecleration()
+            context_ptr_declaration.leadingWhiteSpace = line.leadingWhiteSpace
+            context_ptr_declaration.buildString(DeclarationType.Register, None, '.b64', context_ptr_reg)
+
+            handoff_window_base_declaration = PTXDecleration()
+            handoff_window_base_declaration.leadingWhiteSpace = line.leadingWhiteSpace
+            handoff_window_base_declaration.buildString(DeclarationType.Register, None, '.b64', handoff_window_base_reg)
+
+            context_ptr_init = PTXFunctionalLine()
+            context_ptr_init.leadingWhiteSpace = line.leadingWhiteSpace
+            context_ptr_init.buildString('mov.b64', (context_ptr_reg, '0'))
+
+            handoff_window_base_init = PTXFunctionalLine()
+            handoff_window_base_init.leadingWhiteSpace = line.leadingWhiteSpace
+            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, '0'))
+
+            trace_submit_setup = [
+                context_ptr_declaration,
+                handoff_window_base_declaration,
+                context_ptr_init,
+                handoff_window_base_init,
+            ]
+            line.buildString(FunctionalType.rt_submit, (traversal_finished_reg, context_ptr_reg, handoff_window_base_reg))
+        else:
+            line.buildString(line.functionalType, args)
 
         
         #intersection shaders
@@ -795,7 +829,9 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         end_trace_ray.leadingWhiteSpace = line.leadingWhiteSpace
         end_trace_ray.buildString(FunctionalType.end_trace_ray, ())
 
-        newLines = [traversal_finished_declaration, line, PTXLine('\n')]
+        newLines = [traversal_finished_declaration]
+        newLines.extend(trace_submit_setup)
+        newLines.extend([line, PTXLine('\n')])
         newLines.extend(intersection_lines)
         newLines.append(PTXLine('\n'))
         newLines.extend(anyhit_lines)
