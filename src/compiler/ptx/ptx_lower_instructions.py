@@ -40,20 +40,23 @@ intersection_table_type = Intersection_Table_Type.Baseline
 
 RTCORE_BOOTSTRAP_CONTEXT_BASE = 0x10000000
 RTCORE_CONTEXT_BYTES = 0x280
+RTCORE_MAX_LANES_PER_WARP = 32
+RTCORE_CONTEXT_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_CONTEXT_BYTES
 RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE = 0x20000000
 RTCORE_HANDOFF_WINDOW_SLOT_BYTES = 0x80
+RTCORE_HANDOFF_WINDOW_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_HANDOFF_WINDOW_SLOT_BYTES
 
 
 def rtcore_symbolic_submit_enabled():
     return os.environ.get('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT', '0') == '1'
 
 
-def rtcore_bootstrap_context_ptr(trace_ray_id):
-    return str(RTCORE_BOOTSTRAP_CONTEXT_BASE + trace_ray_id * RTCORE_CONTEXT_BYTES)
+def rtcore_bootstrap_context_base(trace_ray_id):
+    return str(RTCORE_BOOTSTRAP_CONTEXT_BASE + trace_ray_id * RTCORE_CONTEXT_WARP_BYTES)
 
 
 def rtcore_bootstrap_handoff_window_base(trace_ray_id):
-    return str(RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE + trace_ray_id * RTCORE_HANDOFF_WINDOW_SLOT_BYTES)
+    return str(RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE + trace_ray_id * RTCORE_HANDOFF_WINDOW_WARP_BYTES)
 
 
 def vector_suffix_letter(x):
@@ -442,7 +445,22 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         trace_ray_lines = [line]
         if symbolic_rt_submit:
             context_ptr_reg = '%rt_context_ptr_' + str(trace_ray_ID)
+            context_base_reg = '%rt_context_base_' + str(trace_ray_ID)
+            context_lane_offset_reg = '%rt_context_lane_offset_' + str(trace_ray_ID)
+            lane_slot_reg = '%rt_lane_slot_' + str(trace_ray_ID)
             handoff_window_base_reg = '%rt_handoff_window_base_' + str(trace_ray_ID)
+
+            lane_slot_declaration = PTXDecleration()
+            lane_slot_declaration.leadingWhiteSpace = line.leadingWhiteSpace
+            lane_slot_declaration.buildString(DeclarationType.Register, None, '.u32', lane_slot_reg)
+
+            context_base_declaration = PTXDecleration()
+            context_base_declaration.leadingWhiteSpace = line.leadingWhiteSpace
+            context_base_declaration.buildString(DeclarationType.Register, None, '.b64', context_base_reg)
+
+            context_lane_offset_declaration = PTXDecleration()
+            context_lane_offset_declaration.leadingWhiteSpace = line.leadingWhiteSpace
+            context_lane_offset_declaration.buildString(DeclarationType.Register, None, '.b64', context_lane_offset_reg)
 
             context_ptr_declaration = PTXDecleration()
             context_ptr_declaration.leadingWhiteSpace = line.leadingWhiteSpace
@@ -452,17 +470,35 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             handoff_window_base_declaration.leadingWhiteSpace = line.leadingWhiteSpace
             handoff_window_base_declaration.buildString(DeclarationType.Register, None, '.b64', handoff_window_base_reg)
 
+            lane_slot_init = PTXFunctionalLine()
+            lane_slot_init.leadingWhiteSpace = line.leadingWhiteSpace
+            lane_slot_init.buildString('mov.u32', (lane_slot_reg, '%laneid'))
+
+            context_base_init = PTXFunctionalLine()
+            context_base_init.leadingWhiteSpace = line.leadingWhiteSpace
+            context_base_init.buildString('mov.b64', (context_base_reg, rtcore_bootstrap_context_base(trace_ray_ID)))
+
+            context_lane_offset_init = PTXFunctionalLine()
+            context_lane_offset_init.leadingWhiteSpace = line.leadingWhiteSpace
+            context_lane_offset_init.buildString('mul.wide.u32', (context_lane_offset_reg, lane_slot_reg, str(RTCORE_CONTEXT_BYTES)))
+
             context_ptr_init = PTXFunctionalLine()
             context_ptr_init.leadingWhiteSpace = line.leadingWhiteSpace
-            context_ptr_init.buildString('mov.b64', (context_ptr_reg, rtcore_bootstrap_context_ptr(trace_ray_ID)))
+            context_ptr_init.buildString('add.u64', (context_ptr_reg, context_base_reg, context_lane_offset_reg))
 
             handoff_window_base_init = PTXFunctionalLine()
             handoff_window_base_init.leadingWhiteSpace = line.leadingWhiteSpace
             handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_bootstrap_handoff_window_base(trace_ray_ID)))
 
             trace_submit_setup = [
+                lane_slot_declaration,
+                context_base_declaration,
+                context_lane_offset_declaration,
                 context_ptr_declaration,
                 handoff_window_base_declaration,
+                lane_slot_init,
+                context_base_init,
+                context_lane_offset_init,
                 context_ptr_init,
                 handoff_window_base_init,
             ]
@@ -1232,6 +1268,10 @@ def translate_load_const(ptx_shader):
 
 
 def translate_const_operands(ptx_shader):
+    def is_load_const_register(register_name):
+        declaration, _ = ptx_shader.findDeclaration(register_name)
+        return declaration is not None and declaration.isLoadConst
+
     for index in range(len(ptx_shader.lines)):
         line = ptx_shader.lines[index]
         if line.instructionClass != InstructionClass.Functional:
@@ -1245,11 +1285,8 @@ def translate_const_operands(ptx_shader):
 
             debug_print(line.fullLine)
             
-            if src[0] == '%':
-                declaration, _ = ptx_shader.findDeclaration(src)                
-
-                if movType[:2] != '.f' and declaration.isLoadConst:
-                    line.buildString(line.command.split()[0], (dst, src + '_bits'))
+            if src[0] == '%' and movType[:2] != '.f' and is_load_const_register(src):
+                line.buildString(line.command.split()[0], (dst, src + '_bits'))
         
         elif line.command[:4] == 'setp':
             dst, src1, src2 = line.args
@@ -1257,15 +1294,11 @@ def translate_const_operands(ptx_shader):
             type = '.' + line.command.split()[0].split('.')[2]
 
             if type[:2] != '.f':
-                if src1[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src1)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src1 + '_bits', src2))
+                if src1[0] == '%' and is_load_const_register(src1):
+                    line.buildString(line.command.split()[0], (dst, src1 + '_bits', src2))
             
-                if src2[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src2)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src1, src2 + '_bits'))
+                if src2[0] == '%' and is_load_const_register(src2):
+                    line.buildString(line.command.split()[0], (dst, src1, src2 + '_bits'))
         
         elif line.command[:3] == 'add':
             dst, src1, src2 = line.args
@@ -1273,15 +1306,11 @@ def translate_const_operands(ptx_shader):
             type = line.command[3:]
 
             if type[:2] != '.f':
-                if src1[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src1)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src1 + '_bits', src2))
+                if src1[0] == '%' and is_load_const_register(src1):
+                    line.buildString(line.command.split()[0], (dst, src1 + '_bits', src2))
             
-                if src2[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src2)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src1, src2 + '_bits'))
+                if src2[0] == '%' and is_load_const_register(src2):
+                    line.buildString(line.command.split()[0], (dst, src1, src2 + '_bits'))
         
 
         elif line.command[:3] == 'mul':
@@ -1290,15 +1319,11 @@ def translate_const_operands(ptx_shader):
             type = line.command[3:]
 
             if type[:2] != '.f':
-                if src1[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src1)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src1 + '_bits', src2))
+                if src1[0] == '%' and is_load_const_register(src1):
+                    line.buildString(line.command.split()[0], (dst, src1 + '_bits', src2))
             
-                if src2[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src2)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src1, src2 + '_bits'))
+                if src2[0] == '%' and is_load_const_register(src2):
+                    line.buildString(line.command.split()[0], (dst, src1, src2 + '_bits'))
 
 
         elif line.command[:3] == 'shl' or line.command[:3] == 'shr':
@@ -1306,31 +1331,23 @@ def translate_const_operands(ptx_shader):
 
             type = line.command[3:]
             if type[:2] != '.f':
-                if src1[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src1)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src1 + '_bits', src2))
+                if src1[0] == '%' and is_load_const_register(src1):
+                    line.buildString(line.command.split()[0], (dst, src1 + '_bits', src2))
             
-                if src2[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src2)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src1, src2 + '_bits'))
+                if src2[0] == '%' and is_load_const_register(src2):
+                    line.buildString(line.command.split()[0], (dst, src1, src2 + '_bits'))
         
         elif line.command[:4] == 'selp':
             type = line.command[3:]
             if type[:2] != '.f':
 
                 dst, src0, src1, src2 = line.args
-                if src0[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src0)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src0 + '_bits', src1, src2))
+                if src0[0] == '%' and is_load_const_register(src0):
+                    line.buildString(line.command.split()[0], (dst, src0 + '_bits', src1, src2))
 
                 dst, src0, src1, src2 = line.args
-                if src1[0] == '%':
-                    declaration, _ = ptx_shader.findDeclaration(src1)
-                    if declaration.isLoadConst:
-                        line.buildString(line.command.split()[0], (dst, src0, src1 + '_bits', src2))
+                if src1[0] == '%' and is_load_const_register(src1):
+                    line.buildString(line.command.split()[0], (dst, src0, src1 + '_bits', src2))
 
         
 
