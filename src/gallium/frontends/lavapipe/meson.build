@@ -1,12 +1,41 @@
+graphics_root = join_paths(meson.project_source_root(), '..')
+
+embree_root = run_command(
+  prog_python, '-c',
+  'import os; print(os.environ.get("EMBREE_DIR", ""), end="")',
+  check : true
+).stdout().strip()
+if embree_root == ''
+  embree_root = join_paths(graphics_root, 'embree-3.13.4.x86_64.linux')
+endif
+
 embree_lib = 'embree3'
-embree_lib_dir = '/opt/embree-3.12.2.x86_64.linux/lib'
-embree_header_dir = '/opt/embree-3.12.2.x86_64.linux/include'
+embree_lib_dir = join_paths(embree_root, 'lib')
+embree_header_dir = join_paths(embree_root, 'include')
 dep_embree = declare_dependency(
     link_args : ['-L' + embree_lib_dir, '-l' + embree_lib],
     include_directories : include_directories(embree_header_dir))
 
 gpgpusim_lib = 'cudart'
-gpgpusim_lib_dir = '/home/lucy/sim/vulkan-simulator/gpgpu-sim_emerald/lib/gcc-5.5.0/cuda-10000/release'
+gpgpusim_root = run_command(
+  prog_python, '-c',
+  'import os; print(os.environ.get("GPGPUSIM_ROOT", ""), end="")',
+  check : true
+).stdout().strip()
+if gpgpusim_root == ''
+  gpgpusim_root = join_paths(graphics_root, 'vulkan-sim')
+endif
+
+gpgpusim_config = run_command(
+  prog_python, '-c',
+  'import os; print(os.environ.get("GPGPUSIM_CONFIG", ""), end="")',
+  check : true
+).stdout().strip()
+if gpgpusim_config == ''
+  gpgpusim_lib_dir = join_paths(gpgpusim_root, 'lib')
+else
+  gpgpusim_lib_dir = join_paths(gpgpusim_root, 'lib', gpgpusim_config)
+endif
 dep_gpgpusim = declare_dependency(
    link_args : ['-L' + gpgpusim_lib_dir, '-l' + gpgpusim_lib])
 
