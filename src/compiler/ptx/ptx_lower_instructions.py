@@ -39,12 +39,17 @@ class Intersection_Table_Type(Enum):
 intersection_table_type = Intersection_Table_Type.Baseline
 
 RTCORE_BOOTSTRAP_CONTEXT_BASE = 0x10000000
+RTCORE_CONTEXT_ALIGNMENT = 0x40
 RTCORE_CONTEXT_BYTES = 0x280
 RTCORE_MAX_LANES_PER_WARP = 32
 RTCORE_CONTEXT_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_CONTEXT_BYTES
 RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE = 0x20000000
+RTCORE_HANDOFF_WINDOW_ALIGNMENT = 0x80
 RTCORE_HANDOFF_WINDOW_SLOT_BYTES = 0x80
 RTCORE_HANDOFF_WINDOW_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_HANDOFF_WINDOW_SLOT_BYTES
+RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD'
+RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_CONTEXT_BASE'
+RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE'
 RTCORE_PATH_MODE_POLICY_CUSTOM = 'custom'
 RTCORE_PATH_MODE_POLICY_LEGACY = 'legacy'
 RTCORE_PATH_MODE_POLICY_INVALID = 'invalid'
@@ -149,8 +154,51 @@ def rtcore_parse_int_env(name, fallback):
         return fallback
 
 
+def rtcore_driver_runtime_handle_scaffold_enabled():
+    value = os.environ.get(RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD_ENV, '0').strip().lower()
+    if value in ('', '0', 'false', 'off', 'no'):
+        return False
+    if value in ('1', 'true', 'on', 'yes'):
+        return True
+    raise ValueError(
+        'invalid VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD: %s' % value
+    )
+
+
+def rtcore_parse_required_driver_runtime_int_env(name):
+    value = os.environ.get(name)
+    if value is None or value == '':
+        raise ValueError('missing %s for driver/runtime handle scaffold' % name)
+    try:
+        return int(value, 0)
+    except ValueError:
+        raise ValueError('invalid %s: %s' % (name, value))
+
+
+def rtcore_validate_driver_runtime_base_alignment(name, value, alignment):
+    if value % alignment != 0:
+        raise ValueError(
+            'invalid %s alignment: 0x%x is not %u-byte aligned' %
+            (name, value, alignment)
+        )
+
+
 def rtcore_bootstrap_context_base(trace_ray_id):
     return str(RTCORE_BOOTSTRAP_CONTEXT_BASE + trace_ray_id * RTCORE_CONTEXT_WARP_BYTES)
+
+
+def rtcore_driver_runtime_context_base(trace_ray_id):
+    if not rtcore_driver_runtime_handle_scaffold_enabled():
+        return rtcore_bootstrap_context_base(trace_ray_id)
+    context_base = rtcore_parse_required_driver_runtime_int_env(
+        RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV
+    )
+    rtcore_validate_driver_runtime_base_alignment(
+        RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV,
+        context_base,
+        RTCORE_CONTEXT_ALIGNMENT,
+    )
+    return str(context_base + trace_ray_id * RTCORE_CONTEXT_WARP_BYTES)
 
 
 def rtcore_symbolic_handoff_window_base():
@@ -162,6 +210,20 @@ def rtcore_symbolic_handoff_window_base():
 
 def rtcore_bootstrap_handoff_window_base(trace_ray_id):
     return str(rtcore_symbolic_handoff_window_base() + trace_ray_id * RTCORE_HANDOFF_WINDOW_WARP_BYTES)
+
+
+def rtcore_driver_runtime_handoff_window_base(trace_ray_id):
+    if not rtcore_driver_runtime_handle_scaffold_enabled():
+        return rtcore_bootstrap_handoff_window_base(trace_ray_id)
+    handoff_window_base = rtcore_parse_required_driver_runtime_int_env(
+        RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE_ENV
+    )
+    rtcore_validate_driver_runtime_base_alignment(
+        RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE_ENV,
+        handoff_window_base,
+        RTCORE_HANDOFF_WINDOW_ALIGNMENT,
+    )
+    return str(handoff_window_base + trace_ray_id * RTCORE_HANDOFF_WINDOW_WARP_BYTES)
 
 
 def vector_suffix_letter(x):
@@ -581,7 +643,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             context_base_init = PTXFunctionalLine()
             context_base_init.leadingWhiteSpace = line.leadingWhiteSpace
-            context_base_init.buildString('mov.b64', (context_base_reg, rtcore_bootstrap_context_base(trace_ray_ID)))
+            context_base_init.buildString('mov.b64', (context_base_reg, rtcore_driver_runtime_context_base(trace_ray_ID)))
 
             context_lane_offset_init = PTXFunctionalLine()
             context_lane_offset_init.leadingWhiteSpace = line.leadingWhiteSpace
@@ -593,7 +655,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             handoff_window_base_init = PTXFunctionalLine()
             handoff_window_base_init.leadingWhiteSpace = line.leadingWhiteSpace
-            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_bootstrap_handoff_window_base(trace_ray_ID)))
+            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_driver_runtime_handoff_window_base(trace_ray_ID)))
 
             trace_submit_setup = [
                 lane_slot_declaration,
