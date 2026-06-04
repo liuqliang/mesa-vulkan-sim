@@ -45,6 +45,23 @@ RTCORE_CONTEXT_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_CONTEXT_BYTES
 RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE = 0x20000000
 RTCORE_HANDOFF_WINDOW_SLOT_BYTES = 0x80
 RTCORE_HANDOFF_WINDOW_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_HANDOFF_WINDOW_SLOT_BYTES
+RTCORE_PATH_MODE_POLICY_CUSTOM = 'custom'
+RTCORE_PATH_MODE_POLICY_LEGACY = 'legacy'
+RTCORE_PATH_MODE_POLICY_INVALID = 'invalid'
+RTCORE_PATH_MODE_LEGACY_ALIASES = (
+    'legacy',
+    'trace_ray',
+    'trace-ray',
+    'trace_ray_only',
+    'trace-ray-only',
+)
+RTCORE_PATH_MODE_CUSTOM_ALIASES = (
+    'custom',
+    'forward',
+    'forward_sideband',
+    'forward-sideband',
+    'sideband',
+)
 
 
 def rtcore_env_flag_enabled(name):
@@ -56,37 +73,70 @@ def rtcore_path_mode():
     return os.environ.get('VULKAN_SIM_RTCORE_PATH_MODE', '').strip().lower()
 
 
-def rtcore_legacy_trace_ray_path_enabled():
+def rtcore_path_mode_compat_custom_enabled():
+    return (
+        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT') or
+        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_FORWARD_SIDEBAND_PATH') or
+        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_COMPILER_DRIVER_PUBLICATION_SOURCE')
+    )
+
+
+def rtcore_get_path_mode_policy():
     mode = rtcore_path_mode()
-    if mode in ('legacy', 'trace_ray', 'trace-ray', 'trace_ray_only', 'trace-ray-only'):
-        return True
-    if mode in ('custom', 'forward', 'forward_sideband', 'forward-sideband', 'sideband'):
-        return False
-    return rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_LEGACY_TRACE_RAY_PATH')
+    if mode in RTCORE_PATH_MODE_LEGACY_ALIASES:
+        return RTCORE_PATH_MODE_POLICY_LEGACY
+    if mode in RTCORE_PATH_MODE_CUSTOM_ALIASES:
+        return RTCORE_PATH_MODE_POLICY_CUSTOM
+    if mode != '':
+        return RTCORE_PATH_MODE_POLICY_INVALID
+    if rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_LEGACY_TRACE_RAY_PATH'):
+        return RTCORE_PATH_MODE_POLICY_LEGACY
+    if rtcore_path_mode_compat_custom_enabled():
+        return RTCORE_PATH_MODE_POLICY_CUSTOM
+    return RTCORE_PATH_MODE_POLICY_CUSTOM
+
+
+def rtcore_fail_closed_on_invalid_path_mode(policy):
+    if policy == RTCORE_PATH_MODE_POLICY_INVALID:
+        raise ValueError(
+            'invalid VULKAN_SIM_RTCORE_PATH_MODE: %s' % os.environ.get(
+                'VULKAN_SIM_RTCORE_PATH_MODE', ''
+            )
+        )
+
+
+def rtcore_path_mode_policy_legacy_path_enabled(policy):
+    rtcore_fail_closed_on_invalid_path_mode(policy)
+    return policy == RTCORE_PATH_MODE_POLICY_LEGACY
+
+
+def rtcore_path_mode_policy_enables_custom_path(policy):
+    rtcore_fail_closed_on_invalid_path_mode(policy)
+    return policy == RTCORE_PATH_MODE_POLICY_CUSTOM
+
+
+def rtcore_legacy_trace_ray_path_enabled():
+    policy = rtcore_get_path_mode_policy()
+    return rtcore_path_mode_policy_legacy_path_enabled(policy)
 
 
 def rtcore_forward_sideband_path_enabled():
-    return not rtcore_legacy_trace_ray_path_enabled()
+    policy = rtcore_get_path_mode_policy()
+    return rtcore_path_mode_policy_enables_custom_path(policy)
 
 
 def rtcore_symbolic_submit_enabled():
-    if rtcore_legacy_trace_ray_path_enabled():
+    policy = rtcore_get_path_mode_policy()
+    if rtcore_path_mode_policy_legacy_path_enabled(policy):
         return False
-    return (
-        rtcore_forward_sideband_path_enabled() or
-        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT') or
-        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_FORWARD_SIDEBAND_PATH')
-    )
+    return rtcore_path_mode_policy_enables_custom_path(policy)
 
 
 def rtcore_compiler_driver_publication_source_enabled():
-    if rtcore_legacy_trace_ray_path_enabled():
+    policy = rtcore_get_path_mode_policy()
+    if rtcore_path_mode_policy_legacy_path_enabled(policy):
         return False
-    return (
-        rtcore_forward_sideband_path_enabled() or
-        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_COMPILER_DRIVER_PUBLICATION_SOURCE') or
-        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_FORWARD_SIDEBAND_PATH')
-    )
+    return rtcore_path_mode_policy_enables_custom_path(policy)
 
 
 def rtcore_parse_int_env(name, fallback):
