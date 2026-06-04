@@ -52,21 +52,40 @@ def rtcore_env_flag_enabled(name):
     return value != '' and value != '0'
 
 
+def rtcore_path_mode():
+    return os.environ.get('VULKAN_SIM_RTCORE_PATH_MODE', '').strip().lower()
+
+
+def rtcore_legacy_trace_ray_path_enabled():
+    mode = rtcore_path_mode()
+    if mode in ('legacy', 'trace_ray', 'trace-ray', 'trace_ray_only', 'trace-ray-only'):
+        return True
+    if mode in ('custom', 'forward', 'forward_sideband', 'forward-sideband', 'sideband'):
+        return False
+    return rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_LEGACY_TRACE_RAY_PATH')
+
+
 def rtcore_forward_sideband_path_enabled():
-    return rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_FORWARD_SIDEBAND_PATH')
+    return not rtcore_legacy_trace_ray_path_enabled()
 
 
 def rtcore_symbolic_submit_enabled():
+    if rtcore_legacy_trace_ray_path_enabled():
+        return False
     return (
         rtcore_forward_sideband_path_enabled() or
-        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT')
+        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT') or
+        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_FORWARD_SIDEBAND_PATH')
     )
 
 
 def rtcore_compiler_driver_publication_source_enabled():
+    if rtcore_legacy_trace_ray_path_enabled():
+        return False
     return (
         rtcore_forward_sideband_path_enabled() or
-        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_COMPILER_DRIVER_PUBLICATION_SOURCE')
+        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_COMPILER_DRIVER_PUBLICATION_SOURCE') or
+        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_FORWARD_SIDEBAND_PATH')
     )
 
 
