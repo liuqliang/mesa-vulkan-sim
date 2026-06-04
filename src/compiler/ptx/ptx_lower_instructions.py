@@ -51,6 +51,11 @@ def rtcore_symbolic_submit_enabled():
     return os.environ.get('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT', '0') == '1'
 
 
+def rtcore_compiler_driver_publication_source_enabled():
+    value = os.environ.get('VULKAN_SIM_RTCORE_COMPILER_DRIVER_PUBLICATION_SOURCE', '0')
+    return value != '' and value != '0'
+
+
 def rtcore_parse_int_env(name, fallback):
     value = os.environ.get(name)
     if value is None or value == '':
@@ -530,6 +535,31 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 (traversal_finished_reg, context_ptr_reg, handoff_window_base_reg),
             )
             trace_ray_lines = [trace_ray_line, rt_submit_line]
+            if rtcore_compiler_driver_publication_source_enabled():
+                rt_publish_trace_context_line = PTXFunctionalLine()
+                rt_publish_trace_context_line.leadingWhiteSpace = line.leadingWhiteSpace
+                rt_publish_trace_context_line.buildString(
+                    FunctionalType.rt_publish_trace_context,
+                    (
+                        context_ptr_reg,
+                        handoff_window_base_reg,
+                        topLevelAS,
+                        rayFlags,
+                        cullMask,
+                        sbtRecordOffset,
+                        sbtRecordStride,
+                        missIndex,
+                        originRegNames[0],
+                        originRegNames[1],
+                        originRegNames[2],
+                        Tmin,
+                        directionRegNames[0],
+                        directionRegNames[1],
+                        directionRegNames[2],
+                        Tmax,
+                    ),
+                )
+                trace_ray_lines = [trace_ray_line, rt_publish_trace_context_line, rt_submit_line]
         else:
             line.buildString(line.functionalType, args)
 

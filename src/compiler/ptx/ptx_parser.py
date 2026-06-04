@@ -229,6 +229,7 @@ class FunctionalType(Enum, metaclass=MetaEnum):
     load_deref = 'load_deref'
     store_deref = 'store_deref'
     trace_ray = 'trace_ray'
+    rt_publish_trace_context = 'rt_publish_trace_context'
     rt_submit = 'rt_submit'
     rt_retire_context = 'rt_retire_context'
     call_miss_shader = 'call_miss_shader'
