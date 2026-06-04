@@ -47,13 +47,27 @@ RTCORE_HANDOFF_WINDOW_SLOT_BYTES = 0x80
 RTCORE_HANDOFF_WINDOW_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_HANDOFF_WINDOW_SLOT_BYTES
 
 
+def rtcore_env_flag_enabled(name):
+    value = os.environ.get(name, '0')
+    return value != '' and value != '0'
+
+
+def rtcore_forward_sideband_path_enabled():
+    return rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_FORWARD_SIDEBAND_PATH')
+
+
 def rtcore_symbolic_submit_enabled():
-    return os.environ.get('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT', '0') == '1'
+    return (
+        rtcore_forward_sideband_path_enabled() or
+        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT')
+    )
 
 
 def rtcore_compiler_driver_publication_source_enabled():
-    value = os.environ.get('VULKAN_SIM_RTCORE_COMPILER_DRIVER_PUBLICATION_SOURCE', '0')
-    return value != '' and value != '0'
+    return (
+        rtcore_forward_sideband_path_enabled() or
+        rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_COMPILER_DRIVER_PUBLICATION_SOURCE')
+    )
 
 
 def rtcore_parse_int_env(name, fallback):
