@@ -47,6 +47,9 @@ RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE = 0x20000000
 RTCORE_HANDOFF_WINDOW_ALIGNMENT = 0x80
 RTCORE_HANDOFF_WINDOW_SLOT_BYTES = 0x80
 RTCORE_HANDOFF_WINDOW_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_HANDOFF_WINDOW_SLOT_BYTES
+RTCORE_DRIVER_RUNTIME_DEFAULT_CONTEXT_BASE = RTCORE_BOOTSTRAP_CONTEXT_BASE
+RTCORE_DRIVER_RUNTIME_DEFAULT_HANDOFF_WINDOW_BASE = RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE
+RTCORE_DRIVER_RUNTIME_DEFAULT_OWNERSHIP_SOURCE = 'default_runtime_owned'
 RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD'
 RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_CONTEXT_BASE'
 RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE'
@@ -155,14 +158,27 @@ def rtcore_parse_int_env(name, fallback):
 
 
 def rtcore_driver_runtime_handle_scaffold_enabled():
-    value = os.environ.get(RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD_ENV, '0').strip().lower()
-    if value in ('', '0', 'false', 'off', 'no'):
+    value = os.environ.get(RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD_ENV)
+    if value is None or value == '':
+        return True
+    value = value.strip().lower()
+    if value in ('0', 'false', 'off', 'no'):
         return False
     if value in ('1', 'true', 'on', 'yes'):
         return True
     raise ValueError(
         'invalid VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD: %s' % value
     )
+
+
+def rtcore_parse_driver_runtime_int_env(name, fallback):
+    value = os.environ.get(name)
+    if value is None or value == '':
+        return fallback
+    try:
+        return int(value, 0)
+    except ValueError:
+        raise ValueError('invalid %s: %s' % (name, value))
 
 
 def rtcore_parse_required_driver_runtime_int_env(name):
@@ -190,8 +206,9 @@ def rtcore_bootstrap_context_base(trace_ray_id):
 def rtcore_driver_runtime_context_base(trace_ray_id):
     if not rtcore_driver_runtime_handle_scaffold_enabled():
         return rtcore_bootstrap_context_base(trace_ray_id)
-    context_base = rtcore_parse_required_driver_runtime_int_env(
-        RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV
+    context_base = rtcore_parse_driver_runtime_int_env(
+        RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV,
+        RTCORE_DRIVER_RUNTIME_DEFAULT_CONTEXT_BASE,
     )
     rtcore_validate_driver_runtime_base_alignment(
         RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV,
@@ -215,8 +232,9 @@ def rtcore_bootstrap_handoff_window_base(trace_ray_id):
 def rtcore_driver_runtime_handoff_window_base(trace_ray_id):
     if not rtcore_driver_runtime_handle_scaffold_enabled():
         return rtcore_bootstrap_handoff_window_base(trace_ray_id)
-    handoff_window_base = rtcore_parse_required_driver_runtime_int_env(
-        RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE_ENV
+    handoff_window_base = rtcore_parse_driver_runtime_int_env(
+        RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE_ENV,
+        RTCORE_DRIVER_RUNTIME_DEFAULT_HANDOFF_WINDOW_BASE,
     )
     rtcore_validate_driver_runtime_base_alignment(
         RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE_ENV,
