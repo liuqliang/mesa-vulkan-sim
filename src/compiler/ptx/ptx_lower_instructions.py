@@ -226,6 +226,81 @@ def rtcore_driver_runtime_handoff_window_base(trace_ray_id):
     return str(handoff_window_base + trace_ray_id * RTCORE_HANDOFF_WINDOW_WARP_BYTES)
 
 
+def rtcore_raise_compiler_lowering_contract_violation(reason):
+    raise ValueError('RTcore compiler lowering contract violation: %s' % reason)
+
+
+def rtcore_rebuild_conditioned_functional_line(line):
+    if line is None:
+        return
+    line.buildString(line.functionalType, line.args)
+
+
+def rtcore_copy_trace_ray_condition(
+    trace_ray_condition,
+    trace_ray_line=None,
+    rt_submit_line=None,
+    rt_publish_trace_context_line=None,
+    retire_context=None,
+):
+    if trace_ray_line is not None:
+        trace_ray_line.condition = trace_ray_condition
+        rtcore_rebuild_conditioned_functional_line(trace_ray_line)
+    if rt_publish_trace_context_line is not None:
+        rt_publish_trace_context_line.condition = trace_ray_condition
+        rtcore_rebuild_conditioned_functional_line(rt_publish_trace_context_line)
+    if rt_submit_line is not None:
+        rt_submit_line.condition = trace_ray_condition
+        rtcore_rebuild_conditioned_functional_line(rt_submit_line)
+    if retire_context is not None:
+        retire_context.condition = trace_ray_condition
+        rtcore_rebuild_conditioned_functional_line(retire_context)
+
+
+def rtcore_validate_trace_ray_compiler_contract(
+    trace_ray_line,
+    rt_submit_line,
+    rt_publish_trace_context_line,
+    context_ptr_reg,
+    handoff_window_base_reg,
+):
+    if trace_ray_line is None:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'missing generated trace_ray line'
+        )
+    if rt_submit_line is None:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'missing generated rt_submit line'
+        )
+    if len(rt_submit_line.args) != 3:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'rt_submit operand count is %d, expected 3' % len(rt_submit_line.args)
+        )
+    if rt_submit_line.args[1] != context_ptr_reg:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'rt_submit context pointer register is not the generated context register'
+        )
+    if rt_submit_line.args[2] != handoff_window_base_reg:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'rt_submit handoff window register is not the generated window register'
+        )
+    if rt_publish_trace_context_line is None:
+        return
+    if len(rt_publish_trace_context_line.args) != 16:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'rt_publish_trace_context operand count is %d, expected 16'
+            % len(rt_publish_trace_context_line.args)
+        )
+    if rt_publish_trace_context_line.args[0] != context_ptr_reg:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'rt_publish_trace_context context pointer register does not match rt_submit'
+        )
+    if rt_publish_trace_context_line.args[1] != handoff_window_base_reg:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'rt_publish_trace_context handoff window register does not match rt_submit'
+        )
+
+
 def vector_suffix_letter(x):
     if x == 0:
         return 'x'
@@ -609,6 +684,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         args[8:9] = directionRegNames[:3]
         args[6:7] = originRegNames[:3]
         args.append(traversal_finished_reg)
+        trace_ray_condition = line.condition
         trace_ray_lines = [line]
         if symbolic_rt_submit:
             context_ptr_reg = '%rt_context_ptr_' + str(trace_ray_ID)
@@ -679,6 +755,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 FunctionalType.rt_submit,
                 (traversal_finished_reg, context_ptr_reg, handoff_window_base_reg),
             )
+            rt_publish_trace_context_line = None
             trace_ray_lines = [trace_ray_line, rt_submit_line]
             if rtcore_compiler_driver_publication_source_enabled():
                 rt_publish_trace_context_line = PTXFunctionalLine()
@@ -705,6 +782,19 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                     ),
                 )
                 trace_ray_lines = [trace_ray_line, rt_publish_trace_context_line, rt_submit_line]
+            rtcore_copy_trace_ray_condition(
+                trace_ray_condition,
+                trace_ray_line=trace_ray_line,
+                rt_submit_line=rt_submit_line,
+                rt_publish_trace_context_line=rt_publish_trace_context_line,
+            )
+            rtcore_validate_trace_ray_compiler_contract(
+                trace_ray_line,
+                rt_submit_line,
+                rt_publish_trace_context_line,
+                context_ptr_reg,
+                handoff_window_base_reg,
+            )
         else:
             line.buildString(line.functionalType, args)
 
@@ -1088,6 +1178,10 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             retire_context.buildString(
                 FunctionalType.rt_retire_context,
                 (context_ptr_reg, handoff_window_base_reg),
+            )
+            rtcore_copy_trace_ray_condition(
+                trace_ray_condition,
+                retire_context=retire_context,
             )
             trace_retire.append(retire_context)
 
