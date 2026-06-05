@@ -50,6 +50,7 @@ RTCORE_HANDOFF_WINDOW_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_HANDOFF_WI
 RTCORE_DRIVER_RUNTIME_DEFAULT_CONTEXT_BASE = RTCORE_BOOTSTRAP_CONTEXT_BASE
 RTCORE_DRIVER_RUNTIME_DEFAULT_HANDOFF_WINDOW_BASE = RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE
 RTCORE_DRIVER_RUNTIME_DEFAULT_OWNERSHIP_SOURCE = 'default_runtime_owned'
+RTCORE_DRIVER_RUNTIME_HANDLE_BRIDGE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_BRIDGE'
 RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD'
 RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_CONTEXT_BASE'
 RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE'
@@ -191,6 +192,41 @@ def rtcore_parse_required_driver_runtime_int_env(name):
         raise ValueError('invalid %s: %s' % (name, value))
 
 
+def rtcore_driver_runtime_handle_bridge_mode():
+    value = os.environ.get(RTCORE_DRIVER_RUNTIME_HANDLE_BRIDGE_ENV)
+    if value is None or value == '':
+        if not rtcore_driver_runtime_handle_scaffold_enabled():
+            return 'bootstrap_compat'
+        return 'driver_runtime_handle_bridge'
+    value = value.strip().lower()
+    if value in (
+        '1',
+        'true',
+        'on',
+        'yes',
+        'default',
+        'driver_runtime',
+        'driver-runtime',
+        'driver_runtime_handle_bridge',
+        'driver-runtime-handle-bridge',
+        'bridge',
+    ):
+        return 'driver_runtime_handle_bridge'
+    if value in (
+        'bootstrap',
+        'bootstrap_compat',
+        'bootstrap-compat',
+        'scaffold',
+        'compat',
+    ):
+        return 'bootstrap_compat'
+    if value in ('0', 'false', 'off', 'no', 'legacy', 'legacy_opt_out'):
+        return 'legacy_opt_out'
+    raise ValueError(
+        'invalid VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_BRIDGE: %s' % value
+    )
+
+
 def rtcore_validate_driver_runtime_base_alignment(name, value, alignment):
     if value % alignment != 0:
         raise ValueError(
@@ -204,6 +240,13 @@ def rtcore_bootstrap_context_base(trace_ray_id):
 
 
 def rtcore_driver_runtime_context_base(trace_ray_id):
+    return rtcore_driver_runtime_handle_bridge_context_base(trace_ray_id)
+
+
+def rtcore_driver_runtime_handle_bridge_context_base(trace_ray_id):
+    mode = rtcore_driver_runtime_handle_bridge_mode()
+    if mode in ('bootstrap_compat', 'legacy_opt_out'):
+        return rtcore_bootstrap_context_base(trace_ray_id)
     if not rtcore_driver_runtime_handle_scaffold_enabled():
         return rtcore_bootstrap_context_base(trace_ray_id)
     context_base = rtcore_parse_driver_runtime_int_env(
@@ -230,6 +273,13 @@ def rtcore_bootstrap_handoff_window_base(trace_ray_id):
 
 
 def rtcore_driver_runtime_handoff_window_base(trace_ray_id):
+    return rtcore_driver_runtime_handle_bridge_handoff_window_base(trace_ray_id)
+
+
+def rtcore_driver_runtime_handle_bridge_handoff_window_base(trace_ray_id):
+    mode = rtcore_driver_runtime_handle_bridge_mode()
+    if mode in ('bootstrap_compat', 'legacy_opt_out'):
+        return rtcore_bootstrap_handoff_window_base(trace_ray_id)
     if not rtcore_driver_runtime_handle_scaffold_enabled():
         return rtcore_bootstrap_handoff_window_base(trace_ray_id)
     handoff_window_base = rtcore_parse_driver_runtime_int_env(
@@ -737,7 +787,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             context_base_init = PTXFunctionalLine()
             context_base_init.leadingWhiteSpace = line.leadingWhiteSpace
-            context_base_init.buildString('mov.b64', (context_base_reg, rtcore_driver_runtime_context_base(trace_ray_ID)))
+            context_base_init.buildString('mov.b64', (context_base_reg, rtcore_driver_runtime_handle_bridge_context_base(trace_ray_ID)))
 
             context_lane_offset_init = PTXFunctionalLine()
             context_lane_offset_init.leadingWhiteSpace = line.leadingWhiteSpace
@@ -749,7 +799,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             handoff_window_base_init = PTXFunctionalLine()
             handoff_window_base_init.leadingWhiteSpace = line.leadingWhiteSpace
-            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_driver_runtime_handoff_window_base(trace_ray_ID)))
+            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_driver_runtime_handle_bridge_handoff_window_base(trace_ray_ID)))
 
             trace_submit_setup = [
                 lane_slot_declaration,
