@@ -379,10 +379,6 @@ def rtcore_validate_trace_ray_compiler_contract(
     context_ptr_reg,
     handoff_window_base_reg,
 ):
-    if trace_ray_line is None:
-        rtcore_raise_compiler_lowering_contract_violation(
-            'missing generated trace_ray line'
-        )
     if rt_submit_line is None:
         rtcore_raise_compiler_lowering_contract_violation(
             'missing generated rt_submit line'
@@ -860,9 +856,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 context_ptr_init,
                 handoff_window_base_init,
             ]
-            trace_ray_line = PTXFunctionalLine()
-            trace_ray_line.leadingWhiteSpace = line.leadingWhiteSpace
-            trace_ray_line.buildString(line.functionalType, args)
+            trace_ray_line = None
 
             rt_submit_line = PTXFunctionalLine()
             rt_submit_line.leadingWhiteSpace = line.leadingWhiteSpace
@@ -871,7 +865,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 (traversal_finished_reg, context_ptr_reg, handoff_window_base_reg),
             )
             rt_publish_trace_context_line = None
-            trace_ray_lines = [trace_ray_line, rt_submit_line]
+            trace_ray_lines = [rt_submit_line]
             if rtcore_compiler_driver_publication_source_enabled():
                 rt_publish_trace_context_line = PTXFunctionalLine()
                 rt_publish_trace_context_line.leadingWhiteSpace = line.leadingWhiteSpace
@@ -896,7 +890,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                         Tmax,
                     ),
                 )
-                trace_ray_lines = [trace_ray_line, rt_publish_trace_context_line, rt_submit_line]
+                trace_ray_lines = [rt_publish_trace_context_line, rt_submit_line]
             rtcore_copy_trace_ray_condition(
                 trace_ray_condition,
                 trace_ray_line=trace_ray_line,
