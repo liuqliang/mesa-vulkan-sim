@@ -57,6 +57,10 @@ RTCORE_DRIVER_RUNTIME_HANDLE_BRIDGE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HAND
 RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD'
 RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_CONTEXT_BASE'
 RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDOFF_WINDOW_BASE'
+RTCORE_DISPATCH_DESCRIPTOR_V0_SCHEMA = 'rtcore_dispatch_descriptor_v0'
+RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_SCAFFOLD_HIDDEN_BASE = 'scaffold_hidden_base'
+RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_RUNTIME = 'runtime'
+RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_BOOTSTRAP_COMPAT = 'bootstrap_compat'
 RTCORE_PATH_MODE_POLICY_CUSTOM = 'custom'
 RTCORE_PATH_MODE_POLICY_LEGACY = 'legacy'
 RTCORE_PATH_MODE_POLICY_INVALID = 'invalid'
@@ -308,6 +312,60 @@ def rtcore_driver_runtime_launch_allocation_context_base(trace_ray_id):
 def rtcore_driver_runtime_launch_allocation_handoff_window_base(trace_ray_id):
     descriptor = rtcore_driver_runtime_launch_allocation_descriptor(trace_ray_id)
     return str(descriptor['handoff_window_base'])
+
+
+def rtcore_dispatch_descriptor_base_source():
+    mode = rtcore_driver_runtime_handle_bridge_mode()
+    if mode in ('bootstrap_compat', 'legacy_opt_out'):
+        return RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_BOOTSTRAP_COMPAT
+    if rtcore_driver_runtime_handle_scaffold_enabled():
+        return RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_SCAFFOLD_HIDDEN_BASE
+    return RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_BOOTSTRAP_COMPAT
+
+
+def rtcore_dispatch_descriptor_v0(trace_ray_id):
+    allocation = rtcore_driver_runtime_launch_allocation_descriptor(trace_ray_id)
+    return {
+        'schema': RTCORE_DISPATCH_DESCRIPTOR_V0_SCHEMA,
+        'descriptor_base_source': rtcore_dispatch_descriptor_base_source(),
+        'context_base': allocation['context_base'],
+        'context_stride': allocation['context_lane_stride_bytes'],
+        'handoff_window_base': allocation['handoff_window_base'],
+        'handoff_lane_stride': allocation['handoff_lane_slot_stride_bytes'],
+        'as_table_locator': 'compat_proxy_registry',
+        'sbt_locator': 'compat_vulkan_sim_metadata',
+        'launch_metadata': 'trace_ray_id_%u' % trace_ray_id,
+        'allocation': allocation,
+    }
+
+
+def rtcore_dispatch_descriptor_v0_context_base(trace_ray_id):
+    descriptor = rtcore_dispatch_descriptor_v0(trace_ray_id)
+    return str(descriptor['context_base'])
+
+
+def rtcore_dispatch_descriptor_v0_handoff_window_base(trace_ray_id):
+    descriptor = rtcore_dispatch_descriptor_v0(trace_ray_id)
+    return str(descriptor['handoff_window_base'])
+
+
+def rtcore_dispatch_descriptor_v0_marker(trace_ray_id, leading_whitespace):
+    descriptor = rtcore_dispatch_descriptor_v0(trace_ray_id)
+    marker = PTXLine('')
+    marker.fullLine = (
+        leading_whitespace +
+        '// rtcore_dispatch_descriptor_v0 descriptor_base_source=%s '
+        'context_stride=%u handoff_lane_stride=%u as_table_locator=%s '
+        'sbt_locator=%s launch_metadata=%s\n'
+    ) % (
+        descriptor['descriptor_base_source'],
+        descriptor['context_stride'],
+        descriptor['handoff_lane_stride'],
+        descriptor['as_table_locator'],
+        descriptor['sbt_locator'],
+        descriptor['launch_metadata'],
+    )
+    return marker
 
 
 def rtcore_bootstrap_context_base(trace_ray_id):
@@ -804,6 +862,11 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             lane_slot_reg = '%rt_lane_slot_' + str(trace_ray_ID)
             handoff_window_base_reg = '%rt_handoff_window_base_' + str(trace_ray_ID)
 
+            descriptor_marker = rtcore_dispatch_descriptor_v0_marker(
+                trace_ray_ID,
+                line.leadingWhiteSpace,
+            )
+
             lane_slot_declaration = PTXDecleration()
             lane_slot_declaration.leadingWhiteSpace = line.leadingWhiteSpace
             lane_slot_declaration.buildString(DeclarationType.Register, None, '.u32', lane_slot_reg)
@@ -830,7 +893,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             context_base_init = PTXFunctionalLine()
             context_base_init.leadingWhiteSpace = line.leadingWhiteSpace
-            context_base_init.buildString('mov.b64', (context_base_reg, rtcore_driver_runtime_launch_allocation_context_base(trace_ray_ID)))
+            context_base_init.buildString('mov.b64', (context_base_reg, rtcore_dispatch_descriptor_v0_context_base(trace_ray_ID)))
 
             context_lane_offset_init = PTXFunctionalLine()
             context_lane_offset_init.leadingWhiteSpace = line.leadingWhiteSpace
@@ -842,9 +905,10 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             handoff_window_base_init = PTXFunctionalLine()
             handoff_window_base_init.leadingWhiteSpace = line.leadingWhiteSpace
-            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_driver_runtime_launch_allocation_handoff_window_base(trace_ray_ID)))
+            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_dispatch_descriptor_v0_handoff_window_base(trace_ray_ID)))
 
             trace_submit_setup = [
+                descriptor_marker,
                 lane_slot_declaration,
                 context_base_declaration,
                 context_lane_offset_declaration,
