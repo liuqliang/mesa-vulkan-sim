@@ -61,6 +61,7 @@ RTCORE_DISPATCH_DESCRIPTOR_V0_SCHEMA = 'rtcore_dispatch_descriptor_v0'
 RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_SCAFFOLD_HIDDEN_BASE = 'scaffold_hidden_base'
 RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_RUNTIME = 'runtime'
 RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_BOOTSTRAP_COMPAT = 'bootstrap_compat'
+RTCORE_CUSTOM_ABI_LOWERING_EVIDENCE_SCHEMA = 'rtcore_custom_abi_lowering_evidence_v0'
 RTCORE_PATH_MODE_POLICY_CUSTOM = 'custom'
 RTCORE_PATH_MODE_POLICY_LEGACY = 'legacy'
 RTCORE_PATH_MODE_POLICY_INVALID = 'invalid'
@@ -364,6 +365,30 @@ def rtcore_dispatch_descriptor_v0_marker(trace_ray_id, leading_whitespace):
         descriptor['as_table_locator'],
         descriptor['sbt_locator'],
         descriptor['launch_metadata'],
+    )
+    return marker
+
+
+def rtcore_custom_abi_lowering_evidence_marker(trace_ray_id, leading_whitespace):
+    descriptor = rtcore_dispatch_descriptor_v0(trace_ray_id)
+    publish_count = 1 if rtcore_compiler_driver_publication_source_enabled() else 0
+    marker = PTXLine('')
+    marker.fullLine = (
+        leading_whitespace +
+        '// rtcore_custom_abi_lowering_evidence schema=%s trace_ray_id=%u '
+        'descriptor_base_source=%s rt_publish_trace_context_count=%u '
+        'rt_submit_count=%u rt_retire_context_count=%u '
+        'rt_submit_operand_count=%u rt_retire_context_operand_count=%u '
+        'legacy_trace_ray_primary_path=0\n'
+    ) % (
+        RTCORE_CUSTOM_ABI_LOWERING_EVIDENCE_SCHEMA,
+        trace_ray_id,
+        descriptor['descriptor_base_source'],
+        publish_count,
+        1,
+        1,
+        3,
+        2,
     )
     return marker
 
@@ -866,6 +891,10 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 trace_ray_ID,
                 line.leadingWhiteSpace,
             )
+            custom_abi_evidence_marker = rtcore_custom_abi_lowering_evidence_marker(
+                trace_ray_ID,
+                line.leadingWhiteSpace,
+            )
 
             lane_slot_declaration = PTXDecleration()
             lane_slot_declaration.leadingWhiteSpace = line.leadingWhiteSpace
@@ -909,6 +938,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             trace_submit_setup = [
                 descriptor_marker,
+                custom_abi_evidence_marker,
                 lane_slot_declaration,
                 context_base_declaration,
                 context_lane_offset_declaration,
