@@ -61,6 +61,11 @@ RTCORE_DISPATCH_DESCRIPTOR_V0_SCHEMA = 'rtcore_dispatch_descriptor_v0'
 RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_SCAFFOLD_HIDDEN_BASE = 'scaffold_hidden_base'
 RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_RUNTIME = 'runtime'
 RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_BOOTSTRAP_COMPAT = 'bootstrap_compat'
+RTCORE_DISPATCH_DESCRIPTOR_ALLOWED_BASE_SOURCES = (
+    RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_SCAFFOLD_HIDDEN_BASE,
+    RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_RUNTIME,
+    RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_BOOTSTRAP_COMPAT,
+)
 RTCORE_CUSTOM_ABI_LOWERING_EVIDENCE_SCHEMA = 'rtcore_custom_abi_lowering_evidence_v0'
 RTCORE_PATH_MODE_POLICY_CUSTOM = 'custom'
 RTCORE_PATH_MODE_POLICY_LEGACY = 'legacy'
@@ -324,20 +329,54 @@ def rtcore_dispatch_descriptor_base_source():
     return RTCORE_DISPATCH_DESCRIPTOR_BASE_SOURCE_BOOTSTRAP_COMPAT
 
 
+def rtcore_validate_dispatch_descriptor_v0(descriptor):
+    if descriptor.get('schema') != RTCORE_DISPATCH_DESCRIPTOR_V0_SCHEMA:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'dispatch descriptor v0 schema mismatch'
+        )
+    if descriptor.get('descriptor_base_source') not in RTCORE_DISPATCH_DESCRIPTOR_ALLOWED_BASE_SOURCES:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'dispatch descriptor v0 base source is not recognized'
+        )
+    if descriptor.get('context_stride') != RTCORE_CONTEXT_BYTES:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'dispatch descriptor v0 context stride mismatch'
+        )
+    if descriptor.get('handoff_lane_stride') != RTCORE_HANDOFF_WINDOW_SLOT_BYTES:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'dispatch descriptor v0 handoff lane stride mismatch'
+        )
+    if descriptor.get('capacity_lane_slots') != RTCORE_MAX_LANES_PER_WARP:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'dispatch descriptor v0 lane capacity mismatch'
+        )
+    if descriptor.get('context_base') % RTCORE_CONTEXT_ALIGNMENT != 0:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'dispatch descriptor v0 context base alignment mismatch'
+        )
+    if descriptor.get('handoff_window_base') % RTCORE_HANDOFF_WINDOW_ALIGNMENT != 0:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'dispatch descriptor v0 handoff window base alignment mismatch'
+        )
+
+
 def rtcore_dispatch_descriptor_v0(trace_ray_id):
     allocation = rtcore_driver_runtime_launch_allocation_descriptor(trace_ray_id)
-    return {
+    descriptor = {
         'schema': RTCORE_DISPATCH_DESCRIPTOR_V0_SCHEMA,
         'descriptor_base_source': rtcore_dispatch_descriptor_base_source(),
         'context_base': allocation['context_base'],
         'context_stride': allocation['context_lane_stride_bytes'],
         'handoff_window_base': allocation['handoff_window_base'],
         'handoff_lane_stride': allocation['handoff_lane_slot_stride_bytes'],
+        'capacity_lane_slots': allocation['capacity_lane_slots'],
         'as_table_locator': 'compat_proxy_registry',
         'sbt_locator': 'compat_vulkan_sim_metadata',
         'launch_metadata': 'trace_ray_id_%u' % trace_ray_id,
         'allocation': allocation,
     }
+    rtcore_validate_dispatch_descriptor_v0(descriptor)
+    return descriptor
 
 
 def rtcore_dispatch_descriptor_v0_context_base(trace_ray_id):
@@ -365,6 +404,24 @@ def rtcore_dispatch_descriptor_v0_marker(trace_ray_id, leading_whitespace):
         descriptor['as_table_locator'],
         descriptor['sbt_locator'],
         descriptor['launch_metadata'],
+    )
+    return marker
+
+
+def rtcore_dispatch_descriptor_v0_preflight_marker(trace_ray_id, leading_whitespace):
+    descriptor = rtcore_dispatch_descriptor_v0(trace_ray_id)
+    marker = PTXLine('')
+    marker.fullLine = (
+        leading_whitespace +
+        '// rtcore_dispatch_descriptor_v0_preflight schema=%s '
+        'descriptor_validated=1 descriptor_base_source=%s '
+        'capacity_lane_slots=%u context_alignment=%u handoff_alignment=%u\n'
+    ) % (
+        descriptor['schema'],
+        descriptor['descriptor_base_source'],
+        descriptor['capacity_lane_slots'],
+        descriptor['allocation']['context_alignment'],
+        descriptor['allocation']['handoff_alignment'],
     )
     return marker
 
@@ -887,6 +944,10 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             lane_slot_reg = '%rt_lane_slot_' + str(trace_ray_ID)
             handoff_window_base_reg = '%rt_handoff_window_base_' + str(trace_ray_ID)
 
+            preflight_marker = rtcore_dispatch_descriptor_v0_preflight_marker(
+                trace_ray_ID,
+                line.leadingWhiteSpace,
+            )
             descriptor_marker = rtcore_dispatch_descriptor_v0_marker(
                 trace_ray_ID,
                 line.leadingWhiteSpace,
@@ -937,6 +998,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_dispatch_descriptor_v0_handoff_window_base(trace_ray_ID)))
 
             trace_submit_setup = [
+                preflight_marker,
                 descriptor_marker,
                 custom_abi_evidence_marker,
                 lane_slot_declaration,
