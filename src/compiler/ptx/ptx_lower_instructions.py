@@ -998,6 +998,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         args.append(traversal_finished_reg)
         trace_ray_condition = line.condition
         trace_ray_lines = [line]
+        continuation_anchor_lines = []
         if symbolic_rt_submit:
             if trace_ray_ID >= RTCORE_MAX_TRACE_SITES:
                 rtcore_raise_compiler_lowering_contract_violation(
@@ -1321,6 +1322,22 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 context_ptr_reg,
                 handoff_window_base_reg,
             )
+            continuation_anchor_label_str = (
+                'rt_continuation_anchor_' + str(trace_ray_ID)
+            )
+            continuation_anchor_branch = PTXFunctionalLine()
+            continuation_anchor_branch.leadingWhiteSpace = line.leadingWhiteSpace
+            continuation_anchor_branch.buildString(
+                FunctionalType.bra, (continuation_anchor_label_str,)
+            )
+            continuation_anchor_label = PTXLine('')
+            continuation_anchor_label.fullLine = (
+                line.leadingWhiteSpace + continuation_anchor_label_str + ':\n'
+            )
+            continuation_anchor_lines = [
+                continuation_anchor_branch,
+                continuation_anchor_label,
+            ]
         else:
             line.buildString(line.functionalType, args)
 
@@ -1714,6 +1731,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         newLines = [traversal_finished_declaration]
         newLines.extend(trace_submit_setup)
         newLines.extend(trace_ray_lines)
+        newLines.extend(continuation_anchor_lines)
         newLines.append(PTXLine('\n'))
         newLines.extend(intersection_lines)
         newLines.append(PTXLine('\n'))
