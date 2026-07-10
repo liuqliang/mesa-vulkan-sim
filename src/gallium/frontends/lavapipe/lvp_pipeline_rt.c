@@ -190,6 +190,10 @@ lvp_ray_tracing_pipeline_create(
    pipeline->group_handles = vk_zalloc(&device->vk.alloc, 
          sizeof(*pipeline->group_handles) * pipeline->group_count,
          8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   for (uint32_t i = 0; i < pipeline->group_count; i++) {
+      pipeline->group_handles[i].general_index = VK_SHADER_UNUSED_KHR;
+      pipeline->group_handles[i].intersection_index = VK_SHADER_UNUSED_KHR;
+   }
    
    
    if (pipeline == NULL)
