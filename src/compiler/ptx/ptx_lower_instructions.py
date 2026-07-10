@@ -40,19 +40,58 @@ intersection_table_type = Intersection_Table_Type.Baseline
 
 RTCORE_BOOTSTRAP_CONTEXT_BASE = 0x10000000
 RTCORE_CONTEXT_ALIGNMENT = 0x40
-RTCORE_CONTEXT_BYTES = 0x280
+RTCORE_CONTEXT_BYTES = 0x140
 RTCORE_MAX_LANES_PER_WARP = 32
+RTCORE_MAX_CONTEXTS_PER_TRACE_SITE = 1 << 18
+RTCORE_MAX_TRACE_SITES = 8
+RTCORE_MAX_LAUNCH_WIDTH = 512
+RTCORE_MAX_LAUNCH_HEIGHT = 512
+RTCORE_MAX_WINDOWS_PER_TRACE_SITE = (
+    RTCORE_MAX_CONTEXTS_PER_TRACE_SITE // RTCORE_MAX_LANES_PER_WARP
+)
 RTCORE_CONTEXT_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_CONTEXT_BYTES
-RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE = 0x20000000
+RTCORE_CONTEXT_TRACE_SITE_BYTES = (
+    RTCORE_MAX_CONTEXTS_PER_TRACE_SITE * RTCORE_CONTEXT_BYTES
+)
+RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE = 0x40000000
 RTCORE_HANDOFF_WINDOW_ALIGNMENT = 0x80
 RTCORE_HANDOFF_WINDOW_SLOT_BYTES = 0x80
 RTCORE_HANDOFF_WINDOW_WARP_BYTES = RTCORE_MAX_LANES_PER_WARP * RTCORE_HANDOFF_WINDOW_SLOT_BYTES
+RTCORE_HANDOFF_TRACE_SITE_BYTES = (
+    RTCORE_MAX_WINDOWS_PER_TRACE_SITE * RTCORE_HANDOFF_WINDOW_WARP_BYTES
+)
 RTCORE_DRIVER_RUNTIME_DEFAULT_CONTEXT_BASE = RTCORE_BOOTSTRAP_CONTEXT_BASE
 RTCORE_DRIVER_RUNTIME_DEFAULT_HANDOFF_WINDOW_BASE = RTCORE_BOOTSTRAP_HANDOFF_WINDOW_BASE
 RTCORE_DRIVER_RUNTIME_DEFAULT_OWNERSHIP_SOURCE = 'default_runtime_owned'
 RTCORE_DRIVER_RUNTIME_LAUNCH_ALLOCATION_INTERFACE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_LAUNCH_ALLOCATION_INTERFACE'
 RTCORE_DRIVER_RUNTIME_LAUNCH_ALLOCATION_INTERFACE_V0 = 'driver_runtime_launch_allocation_v0'
 RTCORE_DRIVER_RUNTIME_RETIRE_FREE_POLICY = 'retire_context_releases_lane_slot_and_token'
+RTCORE_CONTEXT_V03_FIELD_OFFSETS = {
+    'context_header': 0x000,
+    'as_handle_or_traversable_ref': 0x008,
+    'ray_origin_x': 0x010,
+    'ray_tmin': 0x01c,
+    'ray_direction_x': 0x020,
+    'ray_tmax': 0x02c,
+    'ray_flags': 0x030,
+    'cull_mask': 0x034,
+    'sbt_offset': 0x038,
+    'sbt_stride': 0x03c,
+    'miss_index': 0x040,
+    'sbt_hit_base': 0x048,
+    'sbt_hit_stride': 0x050,
+    'sbt_hit_size': 0x054,
+    'sbt_miss_base': 0x058,
+    'sbt_miss_stride': 0x060,
+    'sbt_miss_size': 0x064,
+    'sbt_callable_base': 0x068,
+    'sbt_callable_stride': 0x070,
+    'sbt_callable_size': 0x074,
+    'pipeline_profile_id': 0x078,
+    'bvh_format_profile_id': 0x07c,
+    'payload_region': 0x080,
+    'hit_state_region': 0x0c0,
+}
 RTCORE_DRIVER_RUNTIME_HANDLE_BRIDGE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_BRIDGE'
 RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_HANDLE_SCAFFOLD'
 RTCORE_DRIVER_RUNTIME_CONTEXT_BASE_ENV = 'VULKAN_SIM_RTCORE_DRIVER_RUNTIME_CONTEXT_BASE'
@@ -298,8 +337,8 @@ def rtcore_driver_runtime_launch_allocation_descriptor(trace_ray_id):
     )
     return {
         'interface': rtcore_driver_runtime_launch_allocation_interface(),
-        'context_base': context_base + trace_ray_id * RTCORE_CONTEXT_WARP_BYTES,
-        'handoff_window_base': handoff_base + trace_ray_id * RTCORE_HANDOFF_WINDOW_WARP_BYTES,
+        'context_base': context_base,
+        'handoff_window_base': handoff_base,
         'context_alignment': RTCORE_CONTEXT_ALIGNMENT,
         'handoff_alignment': RTCORE_HANDOFF_WINDOW_ALIGNMENT,
         'context_lane_stride_bytes': RTCORE_CONTEXT_BYTES,
@@ -422,6 +461,28 @@ def rtcore_dispatch_descriptor_v0_preflight_marker(trace_ray_id, leading_whitesp
         descriptor['capacity_lane_slots'],
         descriptor['allocation']['context_alignment'],
         descriptor['allocation']['handoff_alignment'],
+    )
+    return marker
+
+
+def rtcore_context_v03_field_address_plan_marker(leading_whitespace):
+    assert RTCORE_CONTEXT_V03_FIELD_OFFSETS['payload_region'] == 0x080
+    assert RTCORE_CONTEXT_V03_FIELD_OFFSETS['hit_state_region'] == 0x0c0
+    assert RTCORE_CONTEXT_V03_FIELD_OFFSETS['bvh_format_profile_id'] + 4 == 0x080
+    marker = PTXLine('')
+    marker.fullLine = (
+        leading_whitespace +
+        '// rtcore_context_v03_field_address_plan '
+        'context_header=v_context_ptr+0x000 '
+        'as_ref=v_context_ptr+0x008 ray_origin=v_context_ptr+0x010 '
+        'ray_tmin=v_context_ptr+0x01c ray_direction=v_context_ptr+0x020 '
+        'ray_tmax=v_context_ptr+0x02c ray_flags=v_context_ptr+0x030 '
+        'cull_mask=v_context_ptr+0x034 sbt_offset=v_context_ptr+0x038 '
+        'sbt_stride=v_context_ptr+0x03c miss_index=v_context_ptr+0x040 '
+        'sbt_hit=v_context_ptr+0x048 sbt_miss=v_context_ptr+0x058 '
+        'sbt_callable=v_context_ptr+0x068 '
+        'pipeline_profile=v_context_ptr+0x078 '
+        'bvh_profile=v_context_ptr+0x07c\n'
     )
     return marker
 
@@ -938,10 +999,32 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         trace_ray_condition = line.condition
         trace_ray_lines = [line]
         if symbolic_rt_submit:
+            if trace_ray_ID >= RTCORE_MAX_TRACE_SITES:
+                rtcore_raise_compiler_lowering_contract_violation(
+                    'trace-ray site exceeds bounded compact context arenas'
+                )
             context_ptr_reg = '%rt_context_ptr_' + str(trace_ray_ID)
             context_base_reg = '%rt_context_base_' + str(trace_ray_ID)
             context_lane_offset_reg = '%rt_context_lane_offset_' + str(trace_ray_ID)
+            launch_id_vector_reg = '%rt_launch_id_vec_' + str(trace_ray_ID)
+            launch_size_vector_reg = '%rt_launch_size_vec_' + str(trace_ray_ID)
+            launch_id_regs = [
+                launch_id_vector_reg + '_' + str(component)
+                for component in range(3)
+            ]
+            launch_size_regs = [
+                launch_size_vector_reg + '_' + str(component)
+                for component in range(3)
+            ]
             lane_slot_reg = '%rt_lane_slot_' + str(trace_ray_ID)
+            launch_yz_index_reg = '%rt_launch_yz_index_' + str(trace_ray_ID)
+            context_index_reg = '%rt_context_index_' + str(trace_ray_ID)
+            launch_width_rounded_reg = '%rt_launch_width_rounded_' + str(trace_ray_ID)
+            warps_per_row_reg = '%rt_warps_per_row_' + str(trace_ray_ID)
+            launch_x_warp_index_reg = '%rt_launch_x_warp_index_' + str(trace_ray_ID)
+            global_warp_index_reg = '%rt_global_warp_index_' + str(trace_ray_ID)
+            handoff_window_index_reg = '%rt_handoff_window_index_' + str(trace_ray_ID)
+            handoff_window_offset_reg = '%rt_handoff_window_offset_' + str(trace_ray_ID)
             handoff_window_base_reg = '%rt_handoff_window_base_' + str(trace_ray_ID)
 
             preflight_marker = rtcore_dispatch_descriptor_v0_preflight_marker(
@@ -956,10 +1039,11 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 trace_ray_ID,
                 line.leadingWhiteSpace,
             )
-
-            lane_slot_declaration = PTXDecleration()
-            lane_slot_declaration.leadingWhiteSpace = line.leadingWhiteSpace
-            lane_slot_declaration.buildString(DeclarationType.Register, None, '.u32', lane_slot_reg)
+            context_field_address_plan_marker = (
+                rtcore_context_v03_field_address_plan_marker(
+                    line.leadingWhiteSpace,
+                )
+            )
 
             context_base_declaration = PTXDecleration()
             context_base_declaration.leadingWhiteSpace = line.leadingWhiteSpace
@@ -969,6 +1053,51 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             context_lane_offset_declaration.leadingWhiteSpace = line.leadingWhiteSpace
             context_lane_offset_declaration.buildString(DeclarationType.Register, None, '.b64', context_lane_offset_reg)
 
+            global_index_declarations = []
+            for global_index_reg in (
+                    lane_slot_reg,
+                    launch_yz_index_reg,
+                    context_index_reg,
+                    launch_width_rounded_reg,
+                    warps_per_row_reg,
+                    launch_x_warp_index_reg,
+                    global_warp_index_reg,
+                    handoff_window_index_reg,
+            ):
+                declaration = PTXDecleration()
+                declaration.leadingWhiteSpace = line.leadingWhiteSpace
+                declaration.buildString(
+                    DeclarationType.Register,
+                    None,
+                    '.u32',
+                    global_index_reg,
+                )
+                global_index_declarations.append(declaration)
+
+            launch_vector_declarations = []
+            for launch_vector_reg in (
+                launch_id_vector_reg,
+                launch_size_vector_reg,
+            ):
+                declaration = PTXDecleration()
+                declaration.leadingWhiteSpace = line.leadingWhiteSpace
+                declaration.buildString(
+                    DeclarationType.Register,
+                    '.v4',
+                    '.u32',
+                    launch_vector_reg,
+                )
+                launch_vector_declarations.append(declaration)
+
+            handoff_window_offset_declaration = PTXDecleration()
+            handoff_window_offset_declaration.leadingWhiteSpace = line.leadingWhiteSpace
+            handoff_window_offset_declaration.buildString(
+                DeclarationType.Register,
+                None,
+                '.b64',
+                handoff_window_offset_reg,
+            )
+
             context_ptr_declaration = PTXDecleration()
             context_ptr_declaration.leadingWhiteSpace = line.leadingWhiteSpace
             context_ptr_declaration.buildString(DeclarationType.Register, None, '.b64', context_ptr_reg)
@@ -977,40 +1106,172 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             handoff_window_base_declaration.leadingWhiteSpace = line.leadingWhiteSpace
             handoff_window_base_declaration.buildString(DeclarationType.Register, None, '.b64', handoff_window_base_reg)
 
-            lane_slot_init = PTXFunctionalLine()
-            lane_slot_init.leadingWhiteSpace = line.leadingWhiteSpace
-            lane_slot_init.buildString('mov.u32', (lane_slot_reg, '%laneid'))
-
             context_base_init = PTXFunctionalLine()
             context_base_init.leadingWhiteSpace = line.leadingWhiteSpace
             context_base_init.buildString('mov.b64', (context_base_reg, rtcore_dispatch_descriptor_v0_context_base(trace_ray_ID)))
 
-            context_lane_offset_init = PTXFunctionalLine()
-            context_lane_offset_init.leadingWhiteSpace = line.leadingWhiteSpace
-            context_lane_offset_init.buildString('mul.wide.u32', (context_lane_offset_reg, lane_slot_reg, str(RTCORE_CONTEXT_BYTES)))
+            launch_id_init = PTXFunctionalLine()
+            launch_id_init.leadingWhiteSpace = line.leadingWhiteSpace
+            launch_id_init.buildString(
+                FunctionalType.load_ray_launch_id,
+                (launch_id_vector_reg,),
+            )
 
-            context_ptr_init = PTXFunctionalLine()
-            context_ptr_init.leadingWhiteSpace = line.leadingWhiteSpace
-            context_ptr_init.buildString('add.u64', (context_ptr_reg, context_base_reg, context_lane_offset_reg))
+            launch_size_init = PTXFunctionalLine()
+            launch_size_init.leadingWhiteSpace = line.leadingWhiteSpace
+            launch_size_init.buildString(
+                FunctionalType.load_ray_launch_size,
+                (launch_size_vector_reg,),
+            )
+
+            launch_yz_index_init = PTXFunctionalLine()
+            launch_yz_index_init.leadingWhiteSpace = line.leadingWhiteSpace
+            launch_yz_index_init.buildString(
+                'mad.lo.u32',
+                (
+                    launch_yz_index_reg,
+                    launch_id_regs[2],
+                    launch_size_regs[1],
+                    launch_id_regs[1],
+                ),
+            )
 
             handoff_window_base_init = PTXFunctionalLine()
             handoff_window_base_init.leadingWhiteSpace = line.leadingWhiteSpace
             handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_dispatch_descriptor_v0_handoff_window_base(trace_ray_ID)))
 
+            launch_width_rounded_init = PTXFunctionalLine()
+            launch_width_rounded_init.leadingWhiteSpace = line.leadingWhiteSpace
+            launch_width_rounded_init.buildString(
+                'add.u32',
+                (launch_width_rounded_reg, launch_size_regs[0], '31'),
+            )
+
+            warps_per_row_init = PTXFunctionalLine()
+            warps_per_row_init.leadingWhiteSpace = line.leadingWhiteSpace
+            warps_per_row_init.buildString(
+                'shr.u32',
+                (warps_per_row_reg, launch_width_rounded_reg, '5'),
+            )
+
+            launch_x_warp_index_init = PTXFunctionalLine()
+            launch_x_warp_index_init.leadingWhiteSpace = line.leadingWhiteSpace
+            launch_x_warp_index_init.buildString(
+                'shr.u32',
+                (launch_x_warp_index_reg, launch_id_regs[0], '5'),
+            )
+
+            global_warp_index_init = PTXFunctionalLine()
+            global_warp_index_init.leadingWhiteSpace = line.leadingWhiteSpace
+            global_warp_index_init.buildString(
+                'mad.lo.u32',
+                (
+                    global_warp_index_reg,
+                    launch_yz_index_reg,
+                    warps_per_row_reg,
+                    launch_x_warp_index_reg,
+                ),
+            )
+
+            lane_slot_init = PTXFunctionalLine()
+            lane_slot_init.leadingWhiteSpace = line.leadingWhiteSpace
+            lane_slot_init.buildString(
+                'and.b32',
+                (lane_slot_reg, launch_id_regs[0], '31'),
+            )
+
+            context_index_init = PTXFunctionalLine()
+            context_index_init.leadingWhiteSpace = line.leadingWhiteSpace
+            context_index_init.buildString(
+                'mad.lo.u32',
+                (
+                    context_index_reg,
+                    global_warp_index_reg,
+                    str(RTCORE_MAX_LANES_PER_WARP),
+                    lane_slot_reg,
+                ),
+            )
+
+            context_trace_site_index_init = PTXFunctionalLine()
+            context_trace_site_index_init.leadingWhiteSpace = line.leadingWhiteSpace
+            context_trace_site_index_init.buildString(
+                'add.u32',
+                (
+                    context_index_reg,
+                    context_index_reg,
+                    str(trace_ray_ID * RTCORE_MAX_CONTEXTS_PER_TRACE_SITE),
+                ),
+            )
+
+            context_lane_offset_init = PTXFunctionalLine()
+            context_lane_offset_init.leadingWhiteSpace = line.leadingWhiteSpace
+            context_lane_offset_init.buildString('mul.wide.u32', (context_lane_offset_reg, context_index_reg, str(RTCORE_CONTEXT_BYTES)))
+
+            context_ptr_init = PTXFunctionalLine()
+            context_ptr_init.leadingWhiteSpace = line.leadingWhiteSpace
+            context_ptr_init.buildString('add.u64', (context_ptr_reg, context_base_reg, context_lane_offset_reg))
+
+            handoff_window_index_init = PTXFunctionalLine()
+            handoff_window_index_init.leadingWhiteSpace = line.leadingWhiteSpace
+            handoff_window_index_init.buildString(
+                'add.u32',
+                (
+                    handoff_window_index_reg,
+                    global_warp_index_reg,
+                    str(trace_ray_ID * RTCORE_MAX_WINDOWS_PER_TRACE_SITE),
+                ),
+            )
+
+            handoff_window_offset_init = PTXFunctionalLine()
+            handoff_window_offset_init.leadingWhiteSpace = line.leadingWhiteSpace
+            handoff_window_offset_init.buildString(
+                'mul.wide.u32',
+                (
+                    handoff_window_offset_reg,
+                    handoff_window_index_reg,
+                    str(RTCORE_HANDOFF_WINDOW_WARP_BYTES),
+                ),
+            )
+
+            handoff_window_base_add = PTXFunctionalLine()
+            handoff_window_base_add.leadingWhiteSpace = line.leadingWhiteSpace
+            handoff_window_base_add.buildString(
+                'add.u64',
+                (
+                    handoff_window_base_reg,
+                    handoff_window_base_reg,
+                    handoff_window_offset_reg,
+                ),
+            )
+
             trace_submit_setup = [
                 preflight_marker,
                 descriptor_marker,
                 custom_abi_evidence_marker,
-                lane_slot_declaration,
+                context_field_address_plan_marker,
                 context_base_declaration,
                 context_lane_offset_declaration,
+            ] + launch_vector_declarations + global_index_declarations + [
+                handoff_window_offset_declaration,
                 context_ptr_declaration,
                 handoff_window_base_declaration,
-                lane_slot_init,
                 context_base_init,
+                launch_id_init,
+                launch_size_init,
+                launch_yz_index_init,
+                handoff_window_base_init,
+                launch_width_rounded_init,
+                warps_per_row_init,
+                launch_x_warp_index_init,
+                global_warp_index_init,
+                lane_slot_init,
+                context_index_init,
+                context_trace_site_index_init,
                 context_lane_offset_init,
                 context_ptr_init,
-                handoff_window_base_init,
+                handoff_window_index_init,
+                handoff_window_offset_init,
+                handoff_window_base_add,
             ]
             trace_ray_line = None
 
