@@ -546,6 +546,35 @@ def rtcore_raise_compiler_lowering_contract_violation(reason):
     raise ValueError('RTcore compiler lowering contract violation: %s' % reason)
 
 
+def rtcore_prepare_continuation_ptx_profile(ptx_shader):
+    if (not rtcore_symbolic_submit_enabled() or
+            ptx_shader.getShaderType() != ShaderType.Ray_generation):
+        return
+
+    version_index = None
+    target_index = None
+    for index, line in enumerate(ptx_shader.lines):
+        stripped = line.fullLine.strip()
+        if stripped.startswith('.version '):
+            version_index = index
+        elif stripped.startswith('.target '):
+            target_index = index
+
+    if version_index is None:
+        ptx_shader.lines.insert(0, PTXLine('.version 6.2\n'))
+        version_index = 0
+        if target_index is not None:
+            target_index += 1
+    else:
+        ptx_shader.lines[version_index] = PTXLine('.version 6.2\n')
+
+    target_line = PTXLine('.target sm_30\n')
+    if target_index is None:
+        ptx_shader.lines.insert(version_index + 1, target_line)
+    else:
+        ptx_shader.lines[target_index] = target_line
+
+
 def rtcore_rebuild_conditioned_functional_line(line):
     if line is None:
         return
@@ -1027,6 +1056,9 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             handoff_window_index_reg = '%rt_handoff_window_index_' + str(trace_ray_ID)
             handoff_window_offset_reg = '%rt_handoff_window_offset_' + str(trace_ray_ID)
             handoff_window_base_reg = '%rt_handoff_window_base_' + str(trace_ray_ID)
+            continuation_lane_offset_reg = '%rt_continuation_lane_offset_' + str(trace_ray_ID)
+            continuation_lane_ptr_reg = '%rt_continuation_lane_ptr_' + str(trace_ray_ID)
+            previous_active_mask_reg = '%rt_previous_active_mask_' + str(trace_ray_ID)
 
             preflight_marker = rtcore_dispatch_descriptor_v0_preflight_marker(
                 trace_ray_ID,
@@ -1245,6 +1277,36 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 ),
             )
 
+            continuation_setup = [
+                PTXLine.createNewLine(
+                    line.leadingWhiteSpace + '.reg .b64 ' +
+                    continuation_lane_offset_reg + ';\n'
+                ),
+                PTXLine.createNewLine(
+                    line.leadingWhiteSpace + '.reg .b64 ' +
+                    continuation_lane_ptr_reg + ';\n'
+                ),
+                PTXLine.createNewLine(
+                    line.leadingWhiteSpace + '.reg .u32 ' +
+                    previous_active_mask_reg + ';\n'
+                ),
+                PTXLine.createNewLine(
+                    line.leadingWhiteSpace + 'mul.wide.u32 ' +
+                    continuation_lane_offset_reg + ', ' + lane_slot_reg +
+                    ', ' + str(RTCORE_HANDOFF_WINDOW_SLOT_BYTES) + ';\n'
+                ),
+                PTXLine.createNewLine(
+                    line.leadingWhiteSpace + 'add.u64 ' +
+                    continuation_lane_ptr_reg + ', ' +
+                    handoff_window_base_reg + ', ' +
+                    continuation_lane_offset_reg + ';\n'
+                ),
+                PTXLine.createNewLine(
+                    line.leadingWhiteSpace + 'activemask.b32 ' +
+                    previous_active_mask_reg + ';\n'
+                ),
+            ]
+
             trace_submit_setup = [
                 preflight_marker,
                 descriptor_marker,
@@ -1273,7 +1335,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 handoff_window_index_init,
                 handoff_window_offset_init,
                 handoff_window_base_add,
-            ]
+            ] + continuation_setup
             trace_ray_line = None
 
             rt_submit_line = PTXFunctionalLine()
@@ -1334,10 +1396,175 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             continuation_anchor_label.fullLine = (
                 line.leadingWhiteSpace + continuation_anchor_label_str + ':\n'
             )
+            continuation_suffix = str(trace_ray_ID)
+            continuation_registers = [
+                ('u32', '%rt_shader_hit_result_' + continuation_suffix),
+                ('u32', '%rt_return_reason_' + continuation_suffix),
+                ('u32', '%rt_completion_valid_word_' + continuation_suffix),
+                ('u32', '%rt_next_active_mask_' + continuation_suffix),
+                ('u32', '%rt_masked_next_active_mask_' + continuation_suffix),
+            ]
+            continuation_predicates = [
+                '%rt_completion_valid_' + continuation_suffix,
+                '%rt_reason_anyhit_' + continuation_suffix,
+                '%rt_reason_intersection_' + continuation_suffix,
+                '%rt_reason_continuation_' + continuation_suffix,
+                '%rt_anyhit_accept_' + continuation_suffix,
+                '%rt_anyhit_ignore_' + continuation_suffix,
+                '%rt_anyhit_result_valid_' + continuation_suffix,
+                '%rt_intersection_none_' + continuation_suffix,
+                '%rt_intersection_reported_' + continuation_suffix,
+                '%rt_intersection_result_valid_' + continuation_suffix,
+                '%rt_anyhit_resume_' + continuation_suffix,
+                '%rt_intersection_resume_' + continuation_suffix,
+                '%rt_should_resubmit_' + continuation_suffix,
+                '%rt_next_mask_subset_' + continuation_suffix,
+                '%rt_guarded_resubmit_' + continuation_suffix,
+                '%rt_publication_dirty_' + continuation_suffix,
+                '%rt_round_publication_dirty_' + continuation_suffix,
+            ]
+            continuation_declarations = [
+                PTXLine.createNewLine(
+                    line.leadingWhiteSpace + '.reg .' + register_type + ' ' +
+                    register_name + ';\n'
+                )
+                for register_type, register_name in continuation_registers
+            ] + [
+                PTXLine.createNewLine(
+                    line.leadingWhiteSpace + '.reg .pred ' + predicate + ';\n'
+                )
+                for predicate in continuation_predicates
+            ]
+            hit_result_reg = '%rt_shader_hit_result_' + continuation_suffix
+            return_reason_reg = '%rt_return_reason_' + continuation_suffix
+            completion_word_reg = '%rt_completion_valid_word_' + continuation_suffix
+            next_active_mask_reg = '%rt_next_active_mask_' + continuation_suffix
+            masked_next_active_mask_reg = (
+                '%rt_masked_next_active_mask_' + continuation_suffix
+            )
+            completion_valid_pred = '%rt_completion_valid_' + continuation_suffix
+            anyhit_reason_pred = '%rt_reason_anyhit_' + continuation_suffix
+            intersection_reason_pred = '%rt_reason_intersection_' + continuation_suffix
+            continuation_reason_pred = '%rt_reason_continuation_' + continuation_suffix
+            anyhit_accept_pred = '%rt_anyhit_accept_' + continuation_suffix
+            anyhit_ignore_pred = '%rt_anyhit_ignore_' + continuation_suffix
+            anyhit_valid_pred = '%rt_anyhit_result_valid_' + continuation_suffix
+            intersection_none_pred = '%rt_intersection_none_' + continuation_suffix
+            intersection_reported_pred = '%rt_intersection_reported_' + continuation_suffix
+            intersection_valid_pred = '%rt_intersection_result_valid_' + continuation_suffix
+            anyhit_resume_pred = '%rt_anyhit_resume_' + continuation_suffix
+            intersection_resume_pred = '%rt_intersection_resume_' + continuation_suffix
+            should_resubmit_pred = '%rt_should_resubmit_' + continuation_suffix
+            subset_pred = '%rt_next_mask_subset_' + continuation_suffix
+            guarded_resubmit_pred = '%rt_guarded_resubmit_' + continuation_suffix
+            publication_dirty_pred = '%rt_publication_dirty_' + continuation_suffix
+            round_dirty_pred = '%rt_round_publication_dirty_' + continuation_suffix
+            fence_done_label = 'rt_continuation_fence_done_' + continuation_suffix
+            resubmit_label = 'rt_continuation_resubmit_' + continuation_suffix
+            final_wait_label = 'rt_continuation_final_wait_' + continuation_suffix
+            continuation_body_text = [
+                'mov.u32 %s, 0;' % hit_result_reg,
+                'and.b32 %s, %s, 255;' % (return_reason_reg, traversal_finished_reg),
+                'and.b32 %s, %s, 2147483648;' % (
+                    completion_word_reg, traversal_finished_reg),
+                'setp.ne.u32 %s, %s, 0;' % (
+                    completion_valid_pred, completion_word_reg),
+                'setp.eq.u32 %s, %s, 3;' % (
+                    anyhit_reason_pred, return_reason_reg),
+                'setp.eq.u32 %s, %s, 4;' % (
+                    intersection_reason_pred, return_reason_reg),
+                'or.pred %s, %s, %s;' % (
+                    continuation_reason_pred, anyhit_reason_pred,
+                    intersection_reason_pred),
+                '@%s ld.global.u32 %s, [%s + 52];' % (
+                    continuation_reason_pred, hit_result_reg,
+                    continuation_lane_ptr_reg),
+                'setp.eq.u32 %s, %s, 2;' % (
+                    anyhit_accept_pred, hit_result_reg),
+                'setp.eq.u32 %s, %s, 3;' % (
+                    anyhit_ignore_pred, hit_result_reg),
+                'or.pred %s, %s, %s;' % (
+                    anyhit_valid_pred, anyhit_accept_pred,
+                    anyhit_ignore_pred),
+                'setp.eq.u32 %s, %s, 1;' % (
+                    intersection_none_pred, hit_result_reg),
+                'setp.eq.u32 %s, %s, 4;' % (
+                    intersection_reported_pred, hit_result_reg),
+                'or.pred %s, %s, %s;' % (
+                    intersection_valid_pred, intersection_none_pred,
+                    intersection_reported_pred),
+                'and.pred %s, %s, %s;' % (
+                    anyhit_resume_pred, anyhit_reason_pred,
+                    anyhit_valid_pred),
+                'and.pred %s, %s, %s;' % (
+                    intersection_resume_pred, intersection_reason_pred,
+                    intersection_valid_pred),
+                'or.pred %s, %s, %s;' % (
+                    should_resubmit_pred, anyhit_resume_pred,
+                    intersection_resume_pred),
+                'and.pred %s, %s, %s;' % (
+                    should_resubmit_pred, should_resubmit_pred,
+                    completion_valid_pred),
+                'vote.sync.ballot.b32 %s, %s, %s;' % (
+                    next_active_mask_reg, should_resubmit_pred,
+                    previous_active_mask_reg),
+                'and.b32 %s, %s, %s;' % (
+                    masked_next_active_mask_reg, next_active_mask_reg,
+                    previous_active_mask_reg),
+                'setp.eq.u32 %s, %s, %s;' % (
+                    subset_pred, masked_next_active_mask_reg,
+                    next_active_mask_reg),
+                'and.pred %s, %s, %s;' % (
+                    guarded_resubmit_pred, should_resubmit_pred,
+                    subset_pred),
+                'mov.pred %s, %s;' % (
+                    publication_dirty_pred, continuation_reason_pred),
+                'vote.sync.any.pred %s, %s, %s;' % (
+                    round_dirty_pred, publication_dirty_pred,
+                    previous_active_mask_reg),
+                '@!%s bra %s;' % (round_dirty_pred, fence_done_label),
+                'membar.gl;',
+                fence_done_label + ':',
+                '@%s bra %s;' % (guarded_resubmit_pred, resubmit_label),
+                'bra %s;' % final_wait_label,
+                resubmit_label + ':',
+                'mov.b32 %s, %s;' % (
+                    previous_active_mask_reg, next_active_mask_reg),
+                'rt_submit %s, %s, %s;' % (
+                    traversal_finished_reg, context_ptr_reg,
+                    handoff_window_base_reg),
+                'bra %s;' % continuation_anchor_label_str,
+                final_wait_label + ':',
+            ]
+            continuation_body = []
+            for continuation_line in continuation_body_text:
+                if continuation_line.endswith(':'):
+                    label_line = PTXLine('')
+                    label_line.fullLine = (
+                        line.leadingWhiteSpace + continuation_line + '\n'
+                    )
+                    continuation_body.append(label_line)
+                else:
+                    condition = ''
+                    instruction_text = continuation_line
+                    if continuation_line.startswith('@'):
+                        condition, instruction_text = continuation_line.split(
+                            None, 1
+                        )
+                    instruction_line = PTXLine.createNewLine(
+                        line.leadingWhiteSpace + instruction_text + '\n'
+                    )
+                    if condition:
+                        instruction_line.condition = condition
+                        instruction_line.buildString(
+                            instruction_line.fullFunction,
+                            instruction_line.args,
+                        )
+                    continuation_body.append(instruction_line)
             continuation_anchor_lines = [
                 continuation_anchor_branch,
                 continuation_anchor_label,
-            ]
+            ] + continuation_declarations + continuation_body
         else:
             line.buildString(line.functionalType, args)
 
@@ -1501,6 +1728,9 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             exit_intersection_label.fullLine = line.leadingWhiteSpace + exit_intersection_label_str + ':\n'
             intersection_lines.append(exit_intersection_label)
 
+        if symbolic_rt_submit:
+            intersection_lines = []
+
         if ShaderType.Any_hit in shaderIDs:
             print("NIR-PTX Translator: Anyhit shader identified!")
             '''
@@ -1631,6 +1861,9 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             exit_anyhit_label = PTXLine('')
             exit_anyhit_label.fullLine = line.leadingWhiteSpace + exit_anyhit_label_str + ':\n'
             anyhit_lines.append(exit_anyhit_label)
+
+        if symbolic_rt_submit:
+            anyhit_lines = []
 
         # get hit_geometry
         hit_geometry_reg = '%hit_geometry_' + str(trace_ray_ID)
@@ -1990,6 +2223,81 @@ def translate_exit(ptx_shader):
             continue
 
         line.buildString(FunctionalType.ret, ())
+
+
+def translate_rt_shader_return_epilogue(ptx_shader):
+    if not rtcore_symbolic_submit_enabled():
+        return
+    shader_type = ptx_shader.getShaderType()
+    if shader_type not in (ShaderType.Any_hit, ShaderType.Intersection):
+        return
+
+    leading = '  '
+    prologue = [
+        PTXLine.createNewLine(leading + '.reg .b64 %rt_handoff_lane_ptr;\n'),
+        PTXLine.createNewLine(leading + '.reg .u32 %rt_hit_result;\n'),
+        PTXLine.createNewLine(leading + '.reg .b32 %rt_reported_t;\n'),
+        PTXLine.createNewLine(leading + '.reg .u32 %rt_reported_metadata;\n'),
+    ]
+    for index, line in enumerate(ptx_shader.lines):
+        if (line.instructionClass == InstructionClass.EntryPoint and
+                'main' in line.fullLine):
+            insertion_index = index + 1
+            if '{' not in line.fullLine:
+                while (insertion_index < len(ptx_shader.lines) and
+                       ptx_shader.lines[insertion_index].fullLine.strip() != '{'):
+                    insertion_index += 1
+                insertion_index += 1
+            ptx_shader.lines[insertion_index:insertion_index] = prologue
+            break
+
+    index = 0
+    while index < len(ptx_shader.lines):
+        line = ptx_shader.lines[index]
+        functional_type = getattr(line, 'functionalType', None)
+        if functional_type == FunctionalType.ignore_ray_intersection:
+            ptx_shader.lines[index + 1:index + 1] = [
+                PTXLine.createNewLine(line.leadingWhiteSpace +
+                                      'mov.u32 %rt_hit_result, 3;\n')
+            ]
+            index += 1
+        elif functional_type == FunctionalType.report_ray_intersection:
+            reported_predicate, reported_t, reported_hit_kind = line.args[:3]
+            hit_result_move = PTXFunctionalLine()
+            hit_result_move.leadingWhiteSpace = line.leadingWhiteSpace
+            hit_result_move.condition = '@' + reported_predicate
+            hit_result_move.buildString(
+                'mov.u32', ('%rt_hit_result', '4'))
+            reported_t_move = PTXFunctionalLine()
+            reported_t_move.leadingWhiteSpace = line.leadingWhiteSpace
+            reported_t_move.condition = '@' + reported_predicate
+            reported_t_move.buildString(
+                'mov.b32', ('%rt_reported_t', reported_t))
+            metadata_move = PTXFunctionalLine()
+            metadata_move.leadingWhiteSpace = line.leadingWhiteSpace
+            metadata_move.condition = '@' + reported_predicate
+            metadata_move.buildString(
+                'mov.u32', ('%rt_reported_metadata', reported_hit_kind))
+            ptx_shader.lines[index + 1:index + 1] = [
+                hit_result_move,
+                reported_t_move,
+                metadata_move,
+            ]
+            index += 3
+        elif functional_type == FunctionalType.exit:
+            ptx_shader.lines[index:index] = [
+                PTXLine.createNewLine(line.leadingWhiteSpace +
+                                      'st.global.u32 [%rt_handoff_lane_ptr + 56], '
+                                      '%rt_reported_t;\n'),
+                PTXLine.createNewLine(line.leadingWhiteSpace +
+                                      'st.global.u32 [%rt_handoff_lane_ptr + 60], '
+                                      '%rt_reported_metadata;\n'),
+                PTXLine.createNewLine(line.leadingWhiteSpace +
+                                      'st.global.u32 [%rt_handoff_lane_ptr + 52], '
+                                      '%rt_hit_result;\n'),
+            ]
+            index += 3
+        index += 1
 
 
 def translate_phi(ptx_shader):
@@ -2540,6 +2848,7 @@ def main():
     
     for shader in shaders:
         print("Translating {}".format(shader.filePath))
+        rtcore_prepare_continuation_ptx_profile(shader)
         add_consts(shader)
         add_temps(shader)
 
@@ -2550,6 +2859,7 @@ def main():
         translate_decl_var(shader)
         translate_load_GL_instructions(shader)
         translate_image_deref(shader)
+        translate_rt_shader_return_epilogue(shader)
         translate_exit(shader)
         translate_texture_instructions(shader)
         translate_special_intrinsics(shader)
