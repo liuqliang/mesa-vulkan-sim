@@ -123,6 +123,9 @@ RTCORE_PATH_MODE_CUSTOM_ALIASES = (
     'forward-sideband',
     'sideband',
 )
+RTCORE_CONTINUATION_MODEL_OFF = 'off'
+RTCORE_CONTINUATION_MODEL_SYNTHETIC_SPLIT = 'synthetic_split'
+RTCORE_CONTINUATION_MODEL_ORACLE_SHADER_BOUNDARY = 'oracle_shader_boundary'
 
 
 def rtcore_env_flag_enabled(name):
@@ -139,6 +142,28 @@ def rtcore_path_mode_compat_custom_enabled():
         rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_SYMBOLIC_SUBMIT') or
         rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_FORWARD_SIDEBAND_PATH') or
         rtcore_env_flag_enabled('VULKAN_SIM_RTCORE_COMPILER_DRIVER_PUBLICATION_SOURCE')
+    )
+
+
+def rtcore_continuation_model():
+    return os.environ.get('VULKAN_SIM_RTCORE_CONTINUATION_MODEL', '')
+
+
+def rtcore_validate_custom_continuation_model():
+    model = rtcore_continuation_model()
+    if model == '' or model == RTCORE_CONTINUATION_MODEL_ORACLE_SHADER_BOUNDARY:
+        return
+    if model in (
+            RTCORE_CONTINUATION_MODEL_OFF,
+            RTCORE_CONTINUATION_MODEL_SYNTHETIC_SPLIT):
+        raise ValueError(
+            'custom symbolic RT path requires oracle_shader_boundary; '
+            '%s is not a shader-complete execution model; ' % model +
+            'use VULKAN_SIM_RTCORE_PATH_MODE=legacy for the supported '
+            'no-continuation fallback'
+        )
+    raise ValueError(
+        'invalid VULKAN_SIM_RTCORE_CONTINUATION_MODEL: %s' % model
     )
 
 
@@ -190,7 +215,10 @@ def rtcore_symbolic_submit_enabled():
     policy = rtcore_get_path_mode_policy()
     if rtcore_path_mode_policy_legacy_path_enabled(policy):
         return False
-    return rtcore_path_mode_policy_enables_custom_path(policy)
+    enabled = rtcore_path_mode_policy_enables_custom_path(policy)
+    if enabled:
+        rtcore_validate_custom_continuation_model()
+    return enabled
 
 
 def rtcore_compiler_driver_publication_source_enabled():
