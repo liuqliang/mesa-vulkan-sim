@@ -1434,9 +1434,12 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             ]
             continuation_predicates = [
                 '%rt_completion_valid_' + continuation_suffix,
+                '%rt_reason_miss_' + continuation_suffix,
+                '%rt_reason_closest_hit_' + continuation_suffix,
                 '%rt_reason_anyhit_' + continuation_suffix,
                 '%rt_reason_intersection_' + continuation_suffix,
                 '%rt_reason_continuation_' + continuation_suffix,
+                '%rt_reason_terminal_shader_' + continuation_suffix,
                 '%rt_anyhit_accept_' + continuation_suffix,
                 '%rt_anyhit_ignore_' + continuation_suffix,
                 '%rt_anyhit_result_valid_' + continuation_suffix,
@@ -1471,9 +1474,14 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 '%rt_masked_next_active_mask_' + continuation_suffix
             )
             completion_valid_pred = '%rt_completion_valid_' + continuation_suffix
+            miss_reason_pred = '%rt_reason_miss_' + continuation_suffix
+            closest_hit_reason_pred = '%rt_reason_closest_hit_' + continuation_suffix
             anyhit_reason_pred = '%rt_reason_anyhit_' + continuation_suffix
             intersection_reason_pred = '%rt_reason_intersection_' + continuation_suffix
             continuation_reason_pred = '%rt_reason_continuation_' + continuation_suffix
+            terminal_shader_reason_pred = (
+                '%rt_reason_terminal_shader_' + continuation_suffix
+            )
             anyhit_accept_pred = '%rt_anyhit_accept_' + continuation_suffix
             anyhit_ignore_pred = '%rt_anyhit_ignore_' + continuation_suffix
             anyhit_valid_pred = '%rt_anyhit_result_valid_' + continuation_suffix
@@ -1497,6 +1505,10 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                     completion_word_reg, traversal_finished_reg),
                 'setp.ne.u32 %s, %s, 0;' % (
                     completion_valid_pred, completion_word_reg),
+                'setp.eq.u32 %s, %s, 1;' % (
+                    miss_reason_pred, return_reason_reg),
+                'setp.eq.u32 %s, %s, 2;' % (
+                    closest_hit_reason_pred, return_reason_reg),
                 'setp.eq.u32 %s, %s, 3;' % (
                     anyhit_reason_pred, return_reason_reg),
                 'setp.eq.u32 %s, %s, 4;' % (
@@ -1504,6 +1516,9 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 'or.pred %s, %s, %s;' % (
                     continuation_reason_pred, anyhit_reason_pred,
                     intersection_reason_pred),
+                'or.pred %s, %s, %s;' % (
+                    terminal_shader_reason_pred, miss_reason_pred,
+                    closest_hit_reason_pred),
                 '@%s ld.global.u32 %s, [%s + 52];' % (
                     continuation_reason_pred, hit_result_reg,
                     continuation_lane_ptr_reg),
@@ -1545,8 +1560,9 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 'and.pred %s, %s, %s;' % (
                     guarded_resubmit_pred, should_resubmit_pred,
                     subset_pred),
-                'mov.pred %s, %s;' % (
-                    publication_dirty_pred, continuation_reason_pred),
+                'or.pred %s, %s, %s;' % (
+                    publication_dirty_pred, continuation_reason_pred,
+                    terminal_shader_reason_pred),
                 'vote.sync.any.pred %s, %s, %s;' % (
                     round_dirty_pred, publication_dirty_pred,
                     previous_active_mask_reg),
@@ -1924,7 +1940,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         get_closest_hit_shaderID.buildString(FunctionalType.get_closest_hit_shaderID, (closest_hit_shaderID_reg, ))
         closest_hit_lines.append(get_closest_hit_shaderID)
 
-        for shaderID in shaderIDs[ShaderType.Closest_hit]:
+        for shaderID in shaderIDs.get(ShaderType.Closest_hit, []):
             skip_closest_hit_reg = '%skip_closest_hit_' + str(shaderID) + '_' + str(trace_ray_ID)
             skip_closest_hit_declaration = PTXDecleration()
             skip_closest_hit_declaration.leadingWhiteSpace = line.leadingWhiteSpace
@@ -1989,6 +2005,28 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             )
             trace_retire.append(retire_context)
 
+        terminal_final_dispatch_lines = []
+        if symbolic_rt_submit:
+            terminal_final_dispatch_authority = PTXLine('')
+            terminal_final_dispatch_authority.fullLine = (
+                line.leadingWhiteSpace
+                + '// rtcore_terminal_final_dispatch '
+                + 'authority=shadercore_direct legacy_final_shader_calls=0\n'
+            )
+            terminal_final_dispatch_lines.append(
+                terminal_final_dispatch_authority
+            )
+        else:
+            terminal_final_dispatch_lines.extend(
+                [hit_geometry_declaration, hit_geometry, PTXLine('\n')]
+            )
+            terminal_final_dispatch_lines.extend(closest_hit_lines)
+            terminal_final_dispatch_lines.append(PTXLine('\n'))
+            terminal_final_dispatch_lines.extend(
+                [call_miss_bra, call_miss, skip_miss_label, PTXLine('\n')]
+            )
+        terminal_final_dispatch_lines.append(end_trace_ray)
+
         newLines = [traversal_finished_declaration]
         newLines.extend(trace_submit_setup)
         newLines.extend(trace_ray_lines)
@@ -1998,10 +2036,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         newLines.append(PTXLine('\n'))
         newLines.extend(anyhit_lines)
         newLines.append(PTXLine('\n'))
-        newLines.extend([hit_geometry_declaration, hit_geometry, PTXLine('\n')])
-        newLines.extend(closest_hit_lines)
-        newLines.append(PTXLine('\n'))
-        newLines.extend([call_miss_bra, call_miss, skip_miss_label, PTXLine('\n'), end_trace_ray])
+        newLines.extend(terminal_final_dispatch_lines)
         newLines.extend(trace_retire)
 
 
