@@ -50,6 +50,8 @@
 #include "vk_enum_to_str.h"
 #include "gpgpusim_calls_from_mesa.h"
 
+#include <inttypes.h>
+
 #define VK_PROTOTYPES
 #include <vulkan/vulkan.h>
 
@@ -1192,6 +1194,58 @@ handle_pipeline_access(struct rendering_state *state, gl_shader_stage stage)
    }
 }
 
+static bool
+lvp_translate_trace_sbt_device_address(
+   struct rendering_state *state, const char *region_name,
+   const VkStridedDeviceAddressRegionKHR *region, void **device_addr_out)
+{
+   *device_addr_out = NULL;
+   if (region->size == 0)
+      return true;
+   if (region->deviceAddress == 0) {
+      fprintf(stderr,
+              "LVP: RTCORE SBT address translation fault, region=%s "
+              "fault=sbt_range_out_of_bounds_fail_closed\n",
+              region_name);
+      return false;
+   }
+
+   const uintptr_t host_addr = (uintptr_t)region->deviceAddress;
+   simple_mtx_lock(&state->device->bda_lock);
+   hash_table_foreach(&state->device->bda, he) {
+      const uintptr_t buffer_host_base = (uintptr_t)he->key;
+      struct lvp_buffer *buffer = he->data;
+      if (host_addr < buffer_host_base)
+         continue;
+      const uint64_t offset = host_addr - buffer_host_base;
+      if (offset >= buffer->size)
+         continue;
+      if (region->size > buffer->size - offset ||
+          buffer->pBuffer_gpgpusim == NULL ||
+          offset > UINTPTR_MAX - (uintptr_t)buffer->pBuffer_gpgpusim) {
+         simple_mtx_unlock(&state->device->bda_lock);
+         fprintf(stderr,
+                 "LVP: RTCORE SBT address translation fault, region=%s "
+                 "host_bda=0x%" PRIxPTR " size=%" PRIu64 " "
+                 "buffer_size=%" PRIu64 " "
+                 "fault=sbt_range_out_of_bounds_fail_closed\n",
+                 region_name, host_addr, region->size, buffer->size);
+         return false;
+      }
+      *device_addr_out =
+         (void *)((uintptr_t)buffer->pBuffer_gpgpusim + offset);
+      simple_mtx_unlock(&state->device->bda_lock);
+      return true;
+   }
+   simple_mtx_unlock(&state->device->bda_lock);
+   fprintf(stderr,
+           "LVP: RTCORE SBT address translation fault, region=%s "
+           "host_bda=0x%" PRIxPTR " size=%" PRIu64 " "
+           "fault=unresolved_sbt_bda_fail_closed\n",
+           region_name, host_addr, region->size);
+   return false;
+}
+
 static void handle_trace_ray(struct vk_cmd_queue_entry *cmd,
                             struct rendering_state *state)
 {
@@ -1217,11 +1271,38 @@ static void handle_trace_ray(struct vk_cmd_queue_entry *cmd,
       (void *)cmd->u.trace_rays_khr.callable_shader_binding_table->deviceAddress);
 
    printf("LVP: Launching vkCmdTraceRaysKHR on Vulkan-Sim; Mesa last updated August 29, 2023\n");
+   void *raygen_sbt_device_addr = NULL;
+   void *miss_sbt_device_addr = NULL;
+   void *hit_sbt_device_addr = NULL;
+   void *callable_sbt_device_addr = NULL;
+   if (!lvp_translate_trace_sbt_device_address(
+          state, "raygen",
+          cmd->u.trace_rays_khr.raygen_shader_binding_table,
+          &raygen_sbt_device_addr) ||
+       !lvp_translate_trace_sbt_device_address(
+          state, "miss", cmd->u.trace_rays_khr.miss_shader_binding_table,
+          &miss_sbt_device_addr) ||
+       !lvp_translate_trace_sbt_device_address(
+          state, "hit", cmd->u.trace_rays_khr.hit_shader_binding_table,
+          &hit_sbt_device_addr) ||
+       !lvp_translate_trace_sbt_device_address(
+          state, "callable",
+          cmd->u.trace_rays_khr.callable_shader_binding_table,
+          &callable_sbt_device_addr)) {
+      abort();
+   }
+   printf("LVP: simulator SBT: raygen %p, miss %p, hit %p, callable %p\n",
+          raygen_sbt_device_addr, miss_sbt_device_addr, hit_sbt_device_addr,
+          callable_sbt_device_addr);
    gpgpusim_vkCmdTraceRaysKHR(
       (void *)cmd->u.trace_rays_khr.raygen_shader_binding_table->deviceAddress,
       (void *)cmd->u.trace_rays_khr.miss_shader_binding_table->deviceAddress,
       (void *)cmd->u.trace_rays_khr.hit_shader_binding_table->deviceAddress,
       (void *)cmd->u.trace_rays_khr.callable_shader_binding_table->deviceAddress,
+      raygen_sbt_device_addr,
+      miss_sbt_device_addr,
+      hit_sbt_device_addr,
+      callable_sbt_device_addr,
       cmd->u.trace_rays_khr.raygen_shader_binding_table->stride,
       cmd->u.trace_rays_khr.raygen_shader_binding_table->size,
       cmd->u.trace_rays_khr.miss_shader_binding_table->stride,

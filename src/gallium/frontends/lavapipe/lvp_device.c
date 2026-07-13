@@ -2617,7 +2617,10 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_BindBufferMemory2(VkDevice _device,
                buffer->bo, buffer->pmem, buffer->offset);
 
       // Allocate gpgpu-sim memory
-      void* gpgpusimBuffer = gpgpusim_allocBuffer(buffer->pmem, buffer->size);
+      void *buffer_host_base =
+         (uint8_t *)buffer->pmem + buffer->offset;
+      void *gpgpusimBuffer =
+         gpgpusim_allocBuffer(buffer_host_base, buffer->size);
       printf("LVP: gpgpusim buffer size %ld allocated at %p\n", buffer->size, gpgpusimBuffer);
       buffer->pBuffer_gpgpusim = gpgpusimBuffer;
    }
