@@ -252,6 +252,7 @@ lvp_CreateAccelerationStructureKHR(
       .bo = (struct anv_bo *) buffer->pmem,
       .offset = (buffer->offset + pCreateInfo->offset),
    };
+   accel->type = pCreateInfo->type;
    printf("LVP: Accel structure (size 0x%lx) created from lvp_buffer (size 0x%lx). \n", accel->size, buffer->total_size);
    printf("LVP: Buffer %p + 0x%lx = %p allocated to accel structure %p\n", accel->address.bo, accel->address.offset, (void *)accel->address.bo + accel->address.offset, accel);
 
@@ -259,9 +260,11 @@ lvp_CreateAccelerationStructureKHR(
 
    void *gpgpusim_accel_address =
       (uint8_t *)buffer->pBuffer_gpgpusim + pCreateInfo->offset;
+   accel->gpgpusim_address = gpgpusim_accel_address;
    if (pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
-      gpgpusim_allocTLAS((void *)accel->address.bo + accel->address.offset,
-                         buffer->total_size, gpgpusim_accel_address);
+      gpgpusim_allocTLAS(accel,
+                         (void *)accel->address.bo + accel->address.offset,
+                         accel->size, gpgpusim_accel_address);
    }
    else {
       gpgpusim_allocBLAS((void *)accel->address.bo + accel->address.offset,
@@ -283,6 +286,13 @@ lvp_DestroyAccelerationStructureKHR(
 
    if (!accel)
       return;
+
+   if (accel->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
+      gpgpusim_releaseTLAS(
+         accel,
+         (void *)accel->address.bo + accel->address.offset,
+         accel->gpgpusim_address);
+   }
 
    vk_object_base_finish(&accel->base);
    vk_free2(&device->vk.alloc, pAllocator, accel);

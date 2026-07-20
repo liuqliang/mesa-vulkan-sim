@@ -5,6 +5,8 @@ struct lvp_acceleration_structure {
 
    VkDeviceSize                                 size;
    struct anv_address                           address;
+   VkAccelerationStructureTypeKHR               type;
+   void                                         *gpgpusim_address;
 };
 
 struct anv_batch {
@@ -118,4 +120,3 @@ lvp_batch_has_error(struct anv_batch *batch)
 VkResult anv_reloc_list_add_bo(struct anv_reloc_list *list,
                                const VkAllocationCallbacks *alloc,
                                struct anv_bo *target_bo);
-
