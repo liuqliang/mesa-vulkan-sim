@@ -135,6 +135,9 @@ RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV = (
 RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION_ENV = (
     'VULKAN_SIM_RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION'
 )
+RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER_ENV = (
+    'VULKAN_SIM_RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER'
+)
 
 
 def rtcore_env_flag_enabled(name):
@@ -286,6 +289,29 @@ def rtcore_v04_shadow_shader_return_publication_enabled():
         raise ValueError(
             '%s requires %s' % (
                 RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION_ENV,
+                RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV,
+            )
+        )
+    return True
+
+
+def rtcore_v04_shader_builtin_consumer_enabled():
+    raw_value = os.environ.get(RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER_ENV)
+    if raw_value is None or raw_value.strip().lower() in (
+        '', '0', 'false', 'off', 'no', 'disabled'
+    ):
+        return False
+    if raw_value.strip().lower() not in (
+        '1', 'true', 'on', 'yes', 'enabled'
+    ):
+        raise ValueError(
+            'invalid %s: %s' %
+            (RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER_ENV, raw_value)
+        )
+    if not rtcore_v04_shadow_publication_enabled():
+        raise ValueError(
+            '%s requires %s' % (
+                RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER_ENV,
                 RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV,
             )
         )
@@ -2577,8 +2603,6 @@ def translate_load_GL_instructions(ptx_shader):
             ptx_shader.lines[index:index + 1] = [address_declaration, line] + loads
 
             skip_lines = index + 2
-        
-
         elif line.functionalType == FunctionalType.load_ray_world_direction:
             dst = line.args[0]
 
@@ -2636,6 +2660,64 @@ def translate_load_GL_instructions(ptx_shader):
 
 
 
+def translate_rt_shader_builtin_consumers(ptx_shader):
+    if not rtcore_v04_shader_builtin_consumer_enabled():
+        return
+
+    for line in ptx_shader.lines:
+        if re.match(
+            r'^@!?\S+\s+load_ray_instance_custom_index(?:\s|;|$)',
+            line.command,
+        ):
+            raise ValueError(
+                'predicated V0.4 InstanceCustomIndex consumer is unsupported'
+            )
+
+    shader_type = ptx_shader.getShaderType()
+    supported_shader_types = (
+        ShaderType.Closest_hit,
+        ShaderType.Any_hit,
+        ShaderType.Intersection,
+    )
+    instance_custom_index_offset = rtcore_v04_direct_field_byte_offset(
+        'instance_custom_index'
+    )
+
+    for index, line in enumerate(ptx_shader.lines):
+        if (
+            line.instructionClass != InstructionClass.Functional or
+            line.functionalType !=
+                FunctionalType.load_ray_instance_custom_index
+        ):
+            continue
+        if shader_type not in supported_shader_types:
+            raise ValueError(
+                'V0.4 InstanceCustomIndex consumer is invalid for shader %s' %
+                shader_type
+            )
+        if len(line.args) != 1:
+            raise ValueError(
+                'V0.4 InstanceCustomIndex consumer requires one destination'
+            )
+        if line.condition:
+            raise ValueError(
+                'predicated V0.4 InstanceCustomIndex consumer is unsupported'
+            )
+        load = PTXFunctionalLine()
+        load.leadingWhiteSpace = line.leadingWhiteSpace
+        load.comment = line.comment
+        load.buildString(
+            'ld.global.u32',
+            (
+                line.args[0],
+                rtcore_v04_handoff_word_address(
+                    '%rt_handoff_lane_ptr', instance_custom_index_offset
+                ),
+            ),
+        )
+        ptx_shader.lines[index] = load
+
+
 def translate_image_deref(ptx_shader):
     for index in range(len(ptx_shader.lines)):
         line = ptx_shader.lines[index]
@@ -2680,13 +2762,26 @@ def translate_rt_shader_return_epilogue(ptx_shader):
     v04_shadow_return_publication = (
         rtcore_v04_shadow_shader_return_publication_enabled()
     )
+    v04_builtin_consumer = rtcore_v04_shader_builtin_consumer_enabled()
     if not rtcore_symbolic_submit_enabled():
         return
     shader_type = ptx_shader.getShaderType()
-    if shader_type not in (ShaderType.Any_hit, ShaderType.Intersection):
+    returns_to_rtcore = shader_type in (
+        ShaderType.Any_hit,
+        ShaderType.Intersection,
+    )
+    is_continuation_shader = shader_type in (
+        ShaderType.Miss,
+        ShaderType.Closest_hit,
+        ShaderType.Any_hit,
+        ShaderType.Intersection,
+    )
+    if not returns_to_rtcore and not (
+        v04_builtin_consumer and is_continuation_shader
+    ):
         return
 
-    if v04_shadow_return_publication:
+    if v04_shadow_return_publication and returns_to_rtcore:
         commit_effect_spec = rtcore_v04_field_spec(
             'commit_retained_candidate'
         )
@@ -2735,11 +2830,27 @@ def translate_rt_shader_return_epilogue(ptx_shader):
     leading = '  '
     prologue = [
         PTXLine.createNewLine(leading + '.reg .b64 %rt_handoff_lane_ptr;\n'),
-        PTXLine.createNewLine(leading + '.reg .u32 %rt_hit_result;\n'),
-        PTXLine.createNewLine(leading + '.reg .b32 %rt_reported_t;\n'),
-        PTXLine.createNewLine(leading + '.reg .u32 %rt_reported_metadata;\n'),
     ]
-    if v04_shadow_return_publication:
+    if v04_builtin_consumer:
+        prologue.extend([
+            PTXLine.createNewLine(
+                leading + '.reg .u32 %rt_v04_builtin_consumer_marker;\n'
+            ),
+            PTXLine.createNewLine(
+                leading + '// rtcore_v04_shader_builtin_consumer ' +
+                'profile=' + rtcore_abi_v04.PROFILE_ID + ' source_sha256=' +
+                rtcore_abi_v04.SOURCE_INPUT_SHA256 + '\n'
+            ),
+        ])
+    if returns_to_rtcore:
+        prologue.extend([
+            PTXLine.createNewLine(leading + '.reg .u32 %rt_hit_result;\n'),
+            PTXLine.createNewLine(leading + '.reg .b32 %rt_reported_t;\n'),
+            PTXLine.createNewLine(
+                leading + '.reg .u32 %rt_reported_metadata;\n'
+            ),
+        ])
+    if v04_shadow_return_publication and returns_to_rtcore:
         prologue.append(
             PTXLine.createNewLine(
                 leading + '.reg .u32 %rt_v04_return_effect;\n'
@@ -2782,6 +2893,9 @@ def translate_rt_shader_return_epilogue(ptx_shader):
                 insertion_index += 1
             ptx_shader.lines[insertion_index:insertion_index] = prologue
             break
+
+    if not returns_to_rtcore:
+        return
 
     index = 0
     while index < len(ptx_shader.lines):
@@ -3460,6 +3574,7 @@ def main():
         translate_deref_instructions(shader)
         translate_trace_ray(shader, shaderIDs)
         translate_decl_var(shader)
+        translate_rt_shader_builtin_consumers(shader)
         translate_load_GL_instructions(shader)
         translate_image_deref(shader)
         translate_rt_shader_return_epilogue(shader)
