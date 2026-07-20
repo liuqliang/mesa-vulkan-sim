@@ -30,6 +30,9 @@ from enum import unique
 from ptx_parser import *
 import sys
 import os
+import re
+
+import rtcore_abi_v04_generated as rtcore_abi_v04
 
 
 class Intersection_Table_Type(Enum):
@@ -126,6 +129,9 @@ RTCORE_PATH_MODE_CUSTOM_ALIASES = (
 RTCORE_CONTINUATION_MODEL_OFF = 'off'
 RTCORE_CONTINUATION_MODEL_SYNTHETIC_SPLIT = 'synthetic_split'
 RTCORE_CONTINUATION_MODEL_ORACLE_SHADER_BOUNDARY = 'oracle_shader_boundary'
+RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV = (
+    'VULKAN_SIM_RTCORE_ABI_V04_SHADOW_PUBLICATION'
+)
 
 
 def rtcore_env_flag_enabled(name):
@@ -226,6 +232,315 @@ def rtcore_compiler_driver_publication_source_enabled():
     if rtcore_path_mode_policy_legacy_path_enabled(policy):
         return False
     return rtcore_path_mode_policy_enables_custom_path(policy)
+
+
+def rtcore_v04_shadow_publication_enabled():
+    raw_value = os.environ.get(RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV)
+    if raw_value is None or raw_value.strip().lower() in (
+        '', '0', 'false', 'off', 'no', 'disabled'
+    ):
+        return False
+    if raw_value.strip().lower() not in (
+        '1', 'true', 'on', 'yes', 'enabled'
+    ):
+        raise ValueError(
+            'invalid %s: %s' %
+            (RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV, raw_value)
+        )
+    policy = rtcore_get_path_mode_policy()
+    if not rtcore_path_mode_policy_enables_custom_path(policy):
+        raise ValueError(
+            '%s requires the custom RT path' %
+            RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV
+        )
+    if rtcore_abi_v04.LANE_SLOT_BYTES != RTCORE_HANDOFF_WINDOW_SLOT_BYTES:
+        raise ValueError(
+            'V0.4 shadow lane-slot size %u does not match compiler arena %u' %
+            (
+                rtcore_abi_v04.LANE_SLOT_BYTES,
+                RTCORE_HANDOFF_WINDOW_SLOT_BYTES,
+            )
+        )
+    return True
+
+
+def rtcore_v04_field_spec(field_name):
+    try:
+        return rtcore_abi_v04.FIELD_SPECS[field_name]
+    except KeyError:
+        raise ValueError('missing V0.4 generated field: %s' % field_name)
+
+
+def rtcore_v04_direct_field_byte_offset(field_name):
+    word, lsb, width, mask = rtcore_v04_field_spec(field_name)
+    if lsb != 0 or width != 32 or mask != 0xffffffff:
+        raise ValueError(
+            'V0.4 direct-store field is not a complete word: %s' % field_name
+        )
+    return word * 4
+
+
+def rtcore_v04_u64_field_byte_offset(low_field, high_field):
+    low_word, low_lsb, low_width, low_mask = rtcore_v04_field_spec(low_field)
+    high_word, high_lsb, high_width, high_mask = rtcore_v04_field_spec(
+        high_field
+    )
+    if (
+        low_lsb != 0 or low_width != 32 or low_mask != 0xffffffff or
+        high_lsb != 0 or high_width != 32 or high_mask != 0xffffffff or
+        high_word != low_word + 1
+    ):
+        raise ValueError(
+            'V0.4 u64 fields are not adjacent complete words: %s/%s' %
+            (low_field, high_field)
+        )
+    return low_word * 4
+
+
+def rtcore_v04_unsigned_integer_literal(operand):
+    text = operand.strip()
+    match = re.fullmatch(
+        r'(?P<sign>[+-]?)(?P<body>'
+        r'0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*|[1-9][0-9]*'
+        r')(?P<suffix>[uU](?:[lL]{1,2})?|[lL]{1,2}[uU]?)?',
+        text,
+    )
+    if match is None:
+        return None
+    body = match.group('body')
+    if body.lower().startswith('0x'):
+        base = 16
+        digits = body[2:]
+    elif body.lower().startswith('0b'):
+        base = 2
+        digits = body[2:]
+    elif len(body) > 1 and body.startswith('0'):
+        base = 8
+        digits = body[1:]
+    else:
+        base = 10
+        digits = body
+    value = int(digits or '0', base)
+    return -value if match.group('sign') == '-' else value
+
+
+def rtcore_v04_validate_packed_literal(field_name, operand):
+    value = rtcore_v04_unsigned_integer_literal(operand)
+    if value is None:
+        return
+    _word, _lsb, width, _mask = rtcore_v04_field_spec(field_name)
+    if value < 0 or value >= (1 << width):
+        raise ValueError(
+            'V0.4 shadow %s literal %s does not fit %u bits' %
+            (field_name, operand, width)
+        )
+
+
+def rtcore_conditioned_functional_line(
+    leading_whitespace,
+    condition,
+    function,
+    args,
+):
+    generated = PTXFunctionalLine()
+    generated.leadingWhiteSpace = leading_whitespace
+    generated.condition = condition or ''
+    generated.buildString(function, args)
+    return generated
+
+
+def rtcore_v04_handoff_word_address(lane_ptr_reg, byte_offset):
+    if byte_offset == 0:
+        return '[%s]' % lane_ptr_reg
+    return '[%s + %u]' % (lane_ptr_reg, byte_offset)
+
+
+def rtcore_v04_shadow_trace_input_publication_lines(
+    leading_whitespace,
+    trace_ray_condition,
+    trace_ray_id,
+    lane_ptr_reg,
+    context_ptr_reg,
+    traversable_reference,
+    ray_flags,
+    cull_mask,
+    sbt_record_offset,
+    sbt_record_stride,
+    miss_index,
+    origin_regs,
+    ray_tmin,
+    direction_regs,
+    ray_tmax,
+):
+    packed_w13_reg = '%%rt_v04_shadow_trace_input_w13_%u' % trace_ray_id
+    pack_tmp_reg = '%%rt_v04_shadow_pack_tmp_%u' % trace_ray_id
+    store_b32_reg = '%%rt_v04_shadow_store_b32_%u' % trace_ray_id
+    store_b64_reg = '%%rt_v04_shadow_store_b64_%u' % trace_ray_id
+    zero_reg = '%%rt_v04_shadow_zero_%u' % trace_ray_id
+
+    marker = PTXLine('')
+    marker.fullLine = (
+        leading_whitespace + '// rtcore_v04_shadow_trace_input_publication ' +
+        'profile=' + rtcore_abi_v04.PROFILE_ID + ' source_sha256=' +
+        rtcore_abi_v04.SOURCE_INPUT_SHA256 + '\n'
+    )
+    declarations = []
+    for register_name, register_type in (
+        (packed_w13_reg, '.b32'),
+        (pack_tmp_reg, '.b32'),
+        (store_b32_reg, '.b32'),
+        (store_b64_reg, '.b64'),
+        (zero_reg, '.b32'),
+    ):
+        declaration = PTXDecleration()
+        declaration.leadingWhiteSpace = leading_whitespace
+        declaration.buildString(
+            DeclarationType.Register,
+            None,
+            register_type,
+            register_name,
+        )
+        declarations.append(declaration)
+
+    lines = [marker] + declarations
+
+    direct_u64_fields = (
+        (
+            'context_address_low32',
+            'context_address_high32',
+            context_ptr_reg,
+        ),
+        (
+            'traversable_reference_low32',
+            'traversable_reference_high32',
+            traversable_reference,
+        ),
+    )
+    for low_field, high_field, value in direct_u64_fields:
+        byte_offset = rtcore_v04_u64_field_byte_offset(low_field, high_field)
+        lines.append(rtcore_conditioned_functional_line(
+            leading_whitespace,
+            trace_ray_condition,
+            'mov.b64',
+            (store_b64_reg, value),
+        ))
+        lines.append(rtcore_conditioned_functional_line(
+            leading_whitespace,
+            trace_ray_condition,
+            'st.global.b64',
+            (
+                rtcore_v04_handoff_word_address(lane_ptr_reg, byte_offset),
+                store_b64_reg,
+            ),
+        ))
+
+    direct_b32_fields = (
+        ('world_ray_origin_x_fp32', origin_regs[0]),
+        ('world_ray_origin_y_fp32', origin_regs[1]),
+        ('world_ray_origin_z_fp32', origin_regs[2]),
+        ('ray_tmin_fp32', ray_tmin),
+        ('world_ray_direction_x_fp32', direction_regs[0]),
+        ('world_ray_direction_y_fp32', direction_regs[1]),
+        ('world_ray_direction_z_fp32', direction_regs[2]),
+        ('launch_ray_tmax_fp32', ray_tmax),
+        ('ray_flags', ray_flags),
+    )
+    for field_name, value in direct_b32_fields:
+        byte_offset = rtcore_v04_direct_field_byte_offset(field_name)
+        lines.append(rtcore_conditioned_functional_line(
+            leading_whitespace,
+            trace_ray_condition,
+            'mov.b32',
+            (store_b32_reg, value),
+        ))
+        lines.append(rtcore_conditioned_functional_line(
+            leading_whitespace,
+            trace_ray_condition,
+            'st.global.b32',
+            (
+                rtcore_v04_handoff_word_address(lane_ptr_reg, byte_offset),
+                store_b32_reg,
+            ),
+        ))
+
+    packed_fields = (
+        ('cull_mask', cull_mask),
+        ('sbt_record_offset', sbt_record_offset),
+        ('sbt_record_stride', sbt_record_stride),
+        ('miss_index', miss_index),
+    )
+    packed_word = None
+    lines.append(rtcore_conditioned_functional_line(
+        leading_whitespace,
+        trace_ray_condition,
+        'mov.b32',
+        (packed_w13_reg, '0'),
+    ))
+    for field_name, value in packed_fields:
+        rtcore_v04_validate_packed_literal(field_name, value)
+        word, lsb, width, _mask = rtcore_v04_field_spec(field_name)
+        if packed_word is None:
+            packed_word = word
+        elif word != packed_word:
+            raise ValueError('V0.4 trace policy fields do not share one word')
+        lines.append(rtcore_conditioned_functional_line(
+            leading_whitespace,
+            trace_ray_condition,
+            'and.b32',
+            (pack_tmp_reg, value, str((1 << width) - 1)),
+        ))
+        if lsb != 0:
+            lines.append(rtcore_conditioned_functional_line(
+                leading_whitespace,
+                trace_ray_condition,
+                'shl.b32',
+                (pack_tmp_reg, pack_tmp_reg, str(lsb)),
+            ))
+        lines.append(rtcore_conditioned_functional_line(
+            leading_whitespace,
+            trace_ray_condition,
+            'or.b32',
+            (packed_w13_reg, packed_w13_reg, pack_tmp_reg),
+        ))
+    if packed_word is None:
+        raise ValueError('V0.4 trace policy word has no generated fields')
+    lines.append(rtcore_conditioned_functional_line(
+        leading_whitespace,
+        trace_ray_condition,
+        'st.global.b32',
+        (
+            rtcore_v04_handoff_word_address(lane_ptr_reg, packed_word * 4),
+            packed_w13_reg,
+        ),
+    ))
+
+    fully_reserved_words = tuple(
+        index for index, mask in enumerate(rtcore_abi_v04.RESERVED_MASKS)
+        if mask == 0xffffffff
+    )
+    lines.append(rtcore_conditioned_functional_line(
+        leading_whitespace,
+        trace_ray_condition,
+        'mov.b32',
+        (zero_reg, '0'),
+    ))
+    for word in fully_reserved_words:
+        lines.append(rtcore_conditioned_functional_line(
+            leading_whitespace,
+            trace_ray_condition,
+            'st.global.b32',
+            (
+                rtcore_v04_handoff_word_address(lane_ptr_reg, word * 4),
+                zero_reg,
+            ),
+        ))
+    lines.append(rtcore_conditioned_functional_line(
+        leading_whitespace,
+        trace_ray_condition,
+        'membar.gl',
+        (),
+    ))
+    return lines
 
 
 def rtcore_parse_int_env(name, fallback):
@@ -1038,6 +1353,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         traversal_finished_declaration.buildString(DeclarationType.Register, None, '.u32', traversal_finished_reg)
 
         symbolic_rt_submit = rtcore_symbolic_submit_enabled()
+        v04_shadow_publication = rtcore_v04_shadow_publication_enabled()
         trace_submit_setup = []
 
         topLevelAS, rayFlags, cullMask, sbtRecordOffset, sbtRecordStride, missIndex, origin, Tmin, direction, Tmax, payload = line.args
@@ -1364,6 +1680,26 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 handoff_window_offset_init,
                 handoff_window_base_add,
             ] + continuation_setup
+            if v04_shadow_publication:
+                trace_submit_setup.extend(
+                    rtcore_v04_shadow_trace_input_publication_lines(
+                        line.leadingWhiteSpace,
+                        trace_ray_condition,
+                        trace_ray_ID,
+                        continuation_lane_ptr_reg,
+                        context_ptr_reg,
+                        topLevelAS,
+                        rayFlags,
+                        cullMask,
+                        sbtRecordOffset,
+                        sbtRecordStride,
+                        missIndex,
+                        originRegNames,
+                        Tmin,
+                        directionRegNames,
+                        Tmax,
+                    )
+                )
             trace_ray_line = None
 
             rt_submit_line = PTXFunctionalLine()
@@ -2944,4 +3280,5 @@ def main():
         shader.writeToFile()
 
 
-main()
+if __name__ == '__main__':
+    main()
