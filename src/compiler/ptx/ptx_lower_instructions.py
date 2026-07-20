@@ -132,6 +132,9 @@ RTCORE_CONTINUATION_MODEL_ORACLE_SHADER_BOUNDARY = 'oracle_shader_boundary'
 RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV = (
     'VULKAN_SIM_RTCORE_ABI_V04_SHADOW_PUBLICATION'
 )
+RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION_ENV = (
+    'VULKAN_SIM_RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION'
+)
 
 
 def rtcore_env_flag_enabled(name):
@@ -259,6 +262,31 @@ def rtcore_v04_shadow_publication_enabled():
             (
                 rtcore_abi_v04.LANE_SLOT_BYTES,
                 RTCORE_HANDOFF_WINDOW_SLOT_BYTES,
+            )
+        )
+    return True
+
+
+def rtcore_v04_shadow_shader_return_publication_enabled():
+    raw_value = os.environ.get(
+        RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION_ENV
+    )
+    if raw_value is None or raw_value.strip().lower() in (
+        '', '0', 'false', 'off', 'no', 'disabled'
+    ):
+        return False
+    if raw_value.strip().lower() not in (
+        '1', 'true', 'on', 'yes', 'enabled'
+    ):
+        raise ValueError(
+            'invalid %s: %s' %
+            (RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION_ENV, raw_value)
+        )
+    if not rtcore_v04_shadow_publication_enabled():
+        raise ValueError(
+            '%s requires %s' % (
+                RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION_ENV,
+                RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV,
             )
         )
     return True
@@ -2625,11 +2653,60 @@ def translate_exit(ptx_shader):
 
 
 def translate_rt_shader_return_epilogue(ptx_shader):
+    v04_shadow_return_publication = (
+        rtcore_v04_shadow_shader_return_publication_enabled()
+    )
     if not rtcore_symbolic_submit_enabled():
         return
     shader_type = ptx_shader.getShaderType()
     if shader_type not in (ShaderType.Any_hit, ShaderType.Intersection):
         return
+
+    if v04_shadow_return_publication:
+        commit_effect_spec = rtcore_v04_field_spec(
+            'commit_retained_candidate'
+        )
+        accepted_report_effect_spec = rtcore_v04_field_spec(
+            'accepted_reported_hit_valid'
+        )
+        terminate_effect_spec = rtcore_v04_field_spec('terminate_search')
+        effect_word = commit_effect_spec[0]
+        if any(spec[0] != effect_word for spec in (
+            accepted_report_effect_spec, terminate_effect_spec
+        )):
+            raise ValueError('V0.4 traversal effects do not share one word')
+        if any(spec[2] != 1 for spec in (
+            commit_effect_spec,
+            accepted_report_effect_spec,
+            terminate_effect_spec,
+        )):
+            raise ValueError('V0.4 traversal effects are not single-bit fields')
+        commit_effect_value = commit_effect_spec[3]
+        accepted_report_effect_value = accepted_report_effect_spec[3]
+        return_effect_offset = effect_word * 4
+        if shader_type == ShaderType.Intersection:
+            reported_t_offset = rtcore_v04_direct_field_byte_offset(
+                'reported_t_fp32'
+            )
+            reported_hit_kind_spec = rtcore_v04_field_spec(
+                'reported_hit_kind'
+            )
+            reported_metadata_word = reported_hit_kind_spec[0]
+            if (reported_hit_kind_spec[1], reported_hit_kind_spec[2]) != (0, 8):
+                raise ValueError(
+                    'V0.4 reported hit kind is not the low byte of its word'
+                )
+            if any(
+                rtcore_v04_field_spec(field_name)[0] != reported_metadata_word
+                for field_name in (
+                    'reported_attribute_word_count',
+                    'reported_attribute_format',
+                )
+            ):
+                raise ValueError(
+                    'V0.4 reported metadata does not share one word'
+                )
+            reported_metadata_offset = reported_metadata_word * 4
 
     leading = '  '
     prologue = [
@@ -2638,6 +2715,38 @@ def translate_rt_shader_return_epilogue(ptx_shader):
         PTXLine.createNewLine(leading + '.reg .b32 %rt_reported_t;\n'),
         PTXLine.createNewLine(leading + '.reg .u32 %rt_reported_metadata;\n'),
     ]
+    if v04_shadow_return_publication:
+        prologue.append(
+            PTXLine.createNewLine(
+                leading + '.reg .u32 %rt_v04_return_effect;\n'
+            )
+        )
+        if shader_type == ShaderType.Intersection:
+            prologue.extend([
+                PTXLine.createNewLine(
+                    leading + '.reg .u32 %rt_v04_reported_metadata;\n'
+                ),
+                PTXLine.createNewLine(
+                    leading + '.reg .pred %rt_v04_has_report;\n'
+                ),
+            ])
+        prologue.extend([
+            PTXLine.createNewLine(
+                leading + '// rtcore_v04_shadow_shader_return_publication ' +
+                'profile=' + rtcore_abi_v04.PROFILE_ID + ' source_sha256=' +
+                rtcore_abi_v04.SOURCE_INPUT_SHA256 + '\n'
+            ),
+            PTXLine.createNewLine(
+                leading + 'mov.u32 %%rt_v04_return_effect, %u;\n' %
+                (commit_effect_value
+                 if shader_type == ShaderType.Any_hit else 0)
+            ),
+        ])
+        if shader_type == ShaderType.Intersection:
+            prologue.append(PTXLine.createNewLine(
+                leading + 'mov.u32 %rt_v04_reported_metadata, 0;\n'
+            ))
+
     for index, line in enumerate(ptx_shader.lines):
         if (line.instructionClass == InstructionClass.EntryPoint and
                 'main' in line.fullLine):
@@ -2655,11 +2764,17 @@ def translate_rt_shader_return_epilogue(ptx_shader):
         line = ptx_shader.lines[index]
         functional_type = getattr(line, 'functionalType', None)
         if functional_type == FunctionalType.ignore_ray_intersection:
-            ptx_shader.lines[index + 1:index + 1] = [
+            inserted = [
                 PTXLine.createNewLine(line.leadingWhiteSpace +
                                       'mov.u32 %rt_hit_result, 3;\n')
             ]
-            index += 1
+            if v04_shadow_return_publication:
+                inserted.append(PTXLine.createNewLine(
+                    line.leadingWhiteSpace +
+                    'mov.u32 %rt_v04_return_effect, 0;\n'
+                ))
+            ptx_shader.lines[index + 1:index + 1] = inserted
+            index += len(inserted)
         elif functional_type == FunctionalType.report_ray_intersection:
             reported_predicate, reported_t, reported_hit_kind = line.args[:3]
             hit_result_move = PTXFunctionalLine()
@@ -2677,14 +2792,32 @@ def translate_rt_shader_return_epilogue(ptx_shader):
             metadata_move.condition = '@' + reported_predicate
             metadata_move.buildString(
                 'mov.u32', ('%rt_reported_metadata', reported_hit_kind))
-            ptx_shader.lines[index + 1:index + 1] = [
+            inserted = [
                 hit_result_move,
                 reported_t_move,
                 metadata_move,
             ]
-            index += 3
+            if v04_shadow_return_publication:
+                v04_effect_move = PTXFunctionalLine()
+                v04_effect_move.leadingWhiteSpace = line.leadingWhiteSpace
+                v04_effect_move.condition = '@' + reported_predicate
+                v04_effect_move.buildString(
+                    'mov.u32', (
+                        '%rt_v04_return_effect',
+                        str(accepted_report_effect_value),
+                    ))
+                v04_metadata_move = PTXFunctionalLine()
+                v04_metadata_move.leadingWhiteSpace = line.leadingWhiteSpace
+                v04_metadata_move.condition = '@' + reported_predicate
+                v04_metadata_move.buildString(
+                    'mov.u32',
+                    ('%rt_v04_reported_metadata', reported_hit_kind),
+                )
+                inserted.extend([v04_effect_move, v04_metadata_move])
+            ptx_shader.lines[index + 1:index + 1] = inserted
+            index += len(inserted)
         elif functional_type == FunctionalType.exit:
-            ptx_shader.lines[index:index] = [
+            epilogue = [
                 PTXLine.createNewLine(line.leadingWhiteSpace +
                                       'st.global.u32 [%rt_handoff_lane_ptr + 56], '
                                       '%rt_reported_t;\n'),
@@ -2695,7 +2828,54 @@ def translate_rt_shader_return_epilogue(ptx_shader):
                                       'st.global.u32 [%rt_handoff_lane_ptr + 52], '
                                       '%rt_hit_result;\n'),
             ]
-            index += 3
+            if v04_shadow_return_publication:
+                if shader_type == ShaderType.Intersection:
+                    has_report_test = PTXFunctionalLine()
+                    has_report_test.leadingWhiteSpace = line.leadingWhiteSpace
+                    has_report_test.buildString(
+                        'setp.ne.u32',
+                        ('%rt_v04_has_report',
+                         '%rt_v04_return_effect', '0'),
+                    )
+                    reported_t_store = PTXFunctionalLine()
+                    reported_t_store.leadingWhiteSpace = line.leadingWhiteSpace
+                    reported_t_store.condition = '@%rt_v04_has_report'
+                    reported_t_store.buildString(
+                        'st.global.b32',
+                        (rtcore_v04_handoff_word_address(
+                            '%rt_handoff_lane_ptr', reported_t_offset
+                         ), '%rt_reported_t'),
+                    )
+                    reported_metadata_store = PTXFunctionalLine()
+                    reported_metadata_store.leadingWhiteSpace = (
+                        line.leadingWhiteSpace
+                    )
+                    reported_metadata_store.condition = '@%rt_v04_has_report'
+                    reported_metadata_store.buildString(
+                        'st.global.u32',
+                        (rtcore_v04_handoff_word_address(
+                            '%rt_handoff_lane_ptr', reported_metadata_offset
+                         ), '%rt_v04_reported_metadata'),
+                    )
+                    epilogue.extend([
+                        has_report_test,
+                        reported_t_store,
+                        reported_metadata_store,
+                    ])
+                epilogue.extend([
+                    PTXLine.createNewLine(
+                        line.leadingWhiteSpace +
+                        'st.global.u32 %s, %%rt_v04_return_effect;\n' %
+                        rtcore_v04_handoff_word_address(
+                            '%rt_handoff_lane_ptr', return_effect_offset
+                        )
+                    ),
+                    PTXLine.createNewLine(
+                        line.leadingWhiteSpace + 'membar.gl;\n'
+                    ),
+                ])
+            ptx_shader.lines[index:index] = epilogue
+            index += len(epilogue)
         index += 1
 
 
