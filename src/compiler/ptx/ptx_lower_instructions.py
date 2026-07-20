@@ -151,6 +151,33 @@ RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS = (
         'PrimitiveId',
         'primitive_index',
     ),
+    (
+        FunctionalType.load_ray_geometry_index,
+        'load_ray_geometry_index',
+        'RayGeometryIndex',
+        'geometry_index',
+    ),
+    (
+        FunctionalType.load_ray_instance_id,
+        'load_ray_instance_id',
+        'InstanceId',
+        'instance_index',
+    ),
+    (
+        FunctionalType.load_ray_hit_kind,
+        'load_ray_hit_kind',
+        'HitKind',
+        'hit_kind',
+    ),
+)
+RTCORE_V04_HIT_KIND_SHADER_TYPES = (
+    ShaderType.Closest_hit,
+    ShaderType.Any_hit,
+)
+RTCORE_V04_HIT_IDENTITY_SHADER_TYPES = (
+    ShaderType.Closest_hit,
+    ShaderType.Any_hit,
+    ShaderType.Intersection,
 )
 RTCORE_V04_SUPPORTED_DIRECT_RAY_GEOMETRY_BUILTINS = (
     (
@@ -390,6 +417,15 @@ def rtcore_v04_direct_field_byte_offset(field_name):
             'V0.4 direct-store field is not a complete word: %s' % field_name
         )
     return word * 4
+
+
+def rtcore_v04_packed_field_word_byte_offset(field_name):
+    word, lsb, width, mask = rtcore_v04_field_spec(field_name)
+    if lsb != 0 or width >= 32 or mask != ((1 << width) - 1):
+        raise ValueError(
+            'V0.4 packed field is not low-bit contiguous: %s' % field_name
+        )
+    return word * 4, mask
 
 
 def rtcore_v04_u64_field_byte_offset(low_field, high_field):
@@ -2741,11 +2777,6 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
                 )
 
     shader_type = ptx_shader.getShaderType()
-    supported_hit_shader_types = (
-        ShaderType.Closest_hit,
-        ShaderType.Any_hit,
-        ShaderType.Intersection,
-    )
     supported_ray_shader_types = (
         ShaderType.Miss,
         ShaderType.Closest_hit,
@@ -2776,8 +2807,16 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
             continue
         if hit_builtin_spec is not None:
             display_name, field_name = hit_builtin_spec
-            supported_shader_types = supported_hit_shader_types
-            shape = 'scalar_u32'
+            supported_shader_types = (
+                RTCORE_V04_HIT_KIND_SHADER_TYPES
+                if line.functionalType == FunctionalType.load_ray_hit_kind
+                else RTCORE_V04_HIT_IDENTITY_SHADER_TYPES
+            )
+            shape = (
+                'masked_scalar_u32'
+                if line.functionalType == FunctionalType.load_ray_hit_kind
+                else 'scalar_u32'
+            )
             field_names = (field_name,)
         else:
             display_name, shape, field_names = ray_builtin_spec
@@ -2798,6 +2837,31 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
         if shape == 'stage_scalar_f32':
             field_names = (RTCORE_V04_RAY_TMAX_FIELD_BY_SHADER[shader_type],)
             shape = 'scalar_f32'
+        if shape == 'masked_scalar_u32':
+            field_offset, field_mask = rtcore_v04_packed_field_word_byte_offset(
+                field_names[0]
+            )
+            load = PTXFunctionalLine()
+            load.leadingWhiteSpace = line.leadingWhiteSpace
+            load.comment = line.comment
+            load.buildString(
+                'ld.global.u32',
+                (
+                    line.args[0],
+                    rtcore_v04_handoff_word_address(
+                        '%rt_handoff_lane_ptr', field_offset
+                    ),
+                ),
+            )
+            mask = PTXFunctionalLine()
+            mask.leadingWhiteSpace = line.leadingWhiteSpace
+            mask.buildString(
+                'and.b32',
+                (line.args[0], line.args[0], hex(field_mask)),
+            )
+            ptx_shader.lines[index:index + 1] = [load, mask]
+            index += 2
+            continue
         if shape in ('scalar_u32', 'scalar_f32'):
             field_offset = rtcore_v04_direct_field_byte_offset(field_names[0])
             load = PTXFunctionalLine()

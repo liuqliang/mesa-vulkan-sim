@@ -2431,6 +2431,22 @@ val_type_to_str(val_type type)
 }
 
 
+static bool
+is_ray_hit_identity_stage(gl_shader_stage stage)
+{
+   return stage == MESA_SHADER_CLOSEST_HIT ||
+          stage == MESA_SHADER_ANY_HIT ||
+          stage == MESA_SHADER_INTERSECTION;
+}
+
+
+static bool
+is_ray_hit_kind_stage(gl_shader_stage stage)
+{
+   return stage == MESA_SHADER_CLOSEST_HIT || stage == MESA_SHADER_ANY_HIT;
+}
+
+
 static void
 print_intrinsic_instr_as_ptx(nir_intrinsic_instr *instr, print_state *state, ssa_reg_info *ssa_register_info, unsigned tabs)
 {
@@ -2582,6 +2598,24 @@ print_intrinsic_instr_as_ptx(nir_intrinsic_instr *instr, print_state *state, ssa
          print_tabs(tabs, fp);
       }
       fprintf(fp, "%s ", info->name); // Intrinsic function name
+   }
+   else if ((!strcmp(info->name, "load_ray_geometry_index") &&
+             is_ray_hit_identity_stage(state->shader->info.stage)) ||
+            (!strcmp(info->name, "load_instance_id") &&
+             is_ray_hit_identity_stage(state->shader->info.stage)) ||
+            (!strcmp(info->name, "load_ray_hit_kind") &&
+             is_ray_hit_kind_stage(state->shader->info.stage))){
+      if (info->has_dest) {
+         ssa_register_info[instr->dest.ssa.index].type = UINT;
+         print_ptx_reg_decl(state, instr->dest.ssa.num_components, UINT, instr->dest.ssa.bit_size);
+         print_dest_as_ptx_no_pos(&instr->dest, state);
+         fprintf(fp, ";\n");
+         print_tabs(tabs, fp);
+      }
+      const char *opcode = !strcmp(info->name, "load_instance_id")
+                              ? "load_ray_instance_id"
+                              : info->name;
+      fprintf(fp, "%s ", opcode);
    }
    else if (!strcmp(info->name, "load_ray_world_to_object")){
       if (info->has_dest) {
