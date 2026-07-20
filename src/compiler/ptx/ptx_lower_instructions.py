@@ -152,6 +152,50 @@ RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS = (
         'primitive_index',
     ),
 )
+RTCORE_V04_SUPPORTED_DIRECT_RAY_GEOMETRY_BUILTINS = (
+    (
+        FunctionalType.load_ray_world_origin,
+        'load_ray_world_origin',
+        'WorldRayOrigin',
+        'vector3_f32',
+        (
+            'world_ray_origin_x_fp32',
+            'world_ray_origin_y_fp32',
+            'world_ray_origin_z_fp32',
+        ),
+    ),
+    (
+        FunctionalType.load_ray_world_direction,
+        'load_ray_world_direction',
+        'WorldRayDirection',
+        'vector3_f32',
+        (
+            'world_ray_direction_x_fp32',
+            'world_ray_direction_y_fp32',
+            'world_ray_direction_z_fp32',
+        ),
+    ),
+    (
+        FunctionalType.load_ray_t_min,
+        'load_ray_t_min',
+        'RayTmin',
+        'scalar_f32',
+        ('ray_tmin_fp32',),
+    ),
+    (
+        FunctionalType.load_ray_t_max,
+        'load_ray_t_max',
+        'RayTmax',
+        'stage_scalar_f32',
+        (),
+    ),
+)
+RTCORE_V04_RAY_TMAX_FIELD_BY_SHADER = {
+    ShaderType.Miss: 'launch_ray_tmax_fp32',
+    ShaderType.Closest_hit: 'boundary_ray_tmax_fp32',
+    ShaderType.Any_hit: 'boundary_ray_tmax_fp32',
+    ShaderType.Intersection: 'boundary_ray_tmax_fp32',
+}
 
 
 def rtcore_env_flag_enabled(name):
@@ -2678,10 +2722,15 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
     if not rtcore_v04_shader_builtin_consumer_enabled():
         return
 
+    supported_tables = (
+        RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS,
+        RTCORE_V04_SUPPORTED_DIRECT_RAY_GEOMETRY_BUILTINS,
+    )
     for line in ptx_shader.lines:
-        for _, opcode, display_name, _ in (
-            RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS
+        for spec in tuple(
+            item for table in supported_tables for item in table
         ):
+            _, opcode, display_name = spec[:3]
             if re.match(
                 r'^@!?\S+\s+' + re.escape(opcode) + r'(?:\s|;|$)',
                 line.command,
@@ -2692,24 +2741,47 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
                 )
 
     shader_type = ptx_shader.getShaderType()
-    supported_shader_types = (
+    supported_hit_shader_types = (
         ShaderType.Closest_hit,
         ShaderType.Any_hit,
         ShaderType.Intersection,
     )
-    builtin_specs = {
+    supported_ray_shader_types = (
+        ShaderType.Miss,
+        ShaderType.Closest_hit,
+        ShaderType.Any_hit,
+        ShaderType.Intersection,
+    )
+    hit_builtin_specs = {
         functional_type: (display_name, field_name)
         for functional_type, _, display_name, field_name in
         RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS
     }
+    ray_builtin_specs = {
+        functional_type: (display_name, shape, field_names)
+        for functional_type, _, display_name, shape, field_names in
+        RTCORE_V04_SUPPORTED_DIRECT_RAY_GEOMETRY_BUILTINS
+    }
 
-    for index, line in enumerate(ptx_shader.lines):
+    index = 0
+    while index < len(ptx_shader.lines):
+        line = ptx_shader.lines[index]
         if line.instructionClass != InstructionClass.Functional:
+            index += 1
             continue
-        builtin_spec = builtin_specs.get(line.functionalType)
-        if builtin_spec is None:
+        hit_builtin_spec = hit_builtin_specs.get(line.functionalType)
+        ray_builtin_spec = ray_builtin_specs.get(line.functionalType)
+        if hit_builtin_spec is None and ray_builtin_spec is None:
+            index += 1
             continue
-        display_name, field_name = builtin_spec
+        if hit_builtin_spec is not None:
+            display_name, field_name = hit_builtin_spec
+            supported_shader_types = supported_hit_shader_types
+            shape = 'scalar_u32'
+            field_names = (field_name,)
+        else:
+            display_name, shape, field_names = ray_builtin_spec
+            supported_shader_types = supported_ray_shader_types
         if shader_type not in supported_shader_types:
             raise ValueError(
                 'V0.4 %s consumer is invalid for shader %s' %
@@ -2723,20 +2795,56 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
             raise ValueError(
                 'predicated V0.4 %s consumer is unsupported' % display_name
             )
-        field_offset = rtcore_v04_direct_field_byte_offset(field_name)
-        load = PTXFunctionalLine()
-        load.leadingWhiteSpace = line.leadingWhiteSpace
-        load.comment = line.comment
-        load.buildString(
-            'ld.global.u32',
-            (
-                line.args[0],
-                rtcore_v04_handoff_word_address(
-                    '%rt_handoff_lane_ptr', field_offset
+        if shape == 'stage_scalar_f32':
+            field_names = (RTCORE_V04_RAY_TMAX_FIELD_BY_SHADER[shader_type],)
+            shape = 'scalar_f32'
+        if shape in ('scalar_u32', 'scalar_f32'):
+            field_offset = rtcore_v04_direct_field_byte_offset(field_names[0])
+            load = PTXFunctionalLine()
+            load.leadingWhiteSpace = line.leadingWhiteSpace
+            load.comment = line.comment
+            load.buildString(
+                'ld.global.%s' % ('u32' if shape == 'scalar_u32' else 'f32'),
+                (
+                    line.args[0],
+                    rtcore_v04_handoff_word_address(
+                        '%rt_handoff_lane_ptr', field_offset
+                    ),
                 ),
-            ),
-        )
-        ptx_shader.lines[index] = load
+            )
+            ptx_shader.lines[index] = load
+            index += 1
+            continue
+        if shape != 'vector3_f32':
+            raise ValueError('unsupported V0.4 builtin shape: %s' % shape)
+        declaration, _ = ptx_shader.findDeclaration(line.args[0])
+        if (
+            declaration is None or not declaration.isVector() or
+            declaration.vectorSize() < 3 or declaration.variableType != '.f32'
+        ):
+            raise ValueError(
+                'V0.4 %s consumer requires a float vector destination' %
+                display_name
+            )
+        loads = []
+        for component, field_name in enumerate(field_names):
+            load = PTXFunctionalLine()
+            load.leadingWhiteSpace = line.leadingWhiteSpace
+            if component == 0:
+                load.comment = line.comment
+            load.buildString(
+                'ld.global.f32',
+                (
+                    '%s_%u' % (line.args[0], component),
+                    rtcore_v04_handoff_word_address(
+                        '%rt_handoff_lane_ptr',
+                        rtcore_v04_direct_field_byte_offset(field_name),
+                    ),
+                ),
+            )
+            loads.append(load)
+        ptx_shader.lines[index:index + 1] = loads
+        index += len(loads)
 
 
 def translate_image_deref(ptx_shader):
