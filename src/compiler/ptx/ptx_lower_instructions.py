@@ -979,6 +979,7 @@ def rtcore_validate_trace_ray_compiler_contract(
     rt_publish_trace_context_line,
     context_ptr_reg,
     handoff_window_base_reg,
+    v04_shadow_publication=False,
 ):
     if rt_submit_line is None:
         rtcore_raise_compiler_lowering_contract_violation(
@@ -998,10 +999,14 @@ def rtcore_validate_trace_ray_compiler_contract(
         )
     if rt_publish_trace_context_line is None:
         return
-    if len(rt_publish_trace_context_line.args) != 16:
+    expected_publish_operand_count = 17 if v04_shadow_publication else 16
+    if len(rt_publish_trace_context_line.args) != expected_publish_operand_count:
         rtcore_raise_compiler_lowering_contract_violation(
-            'rt_publish_trace_context operand count is %d, expected 16'
-            % len(rt_publish_trace_context_line.args)
+            'rt_publish_trace_context operand count is %d, expected %d'
+            % (
+                len(rt_publish_trace_context_line.args),
+                expected_publish_operand_count,
+            )
         )
     if rt_publish_trace_context_line.args[0] != context_ptr_reg:
         rtcore_raise_compiler_lowering_contract_violation(
@@ -1010,6 +1015,14 @@ def rtcore_validate_trace_ray_compiler_contract(
     if rt_publish_trace_context_line.args[1] != handoff_window_base_reg:
         rtcore_raise_compiler_lowering_contract_violation(
             'rt_publish_trace_context handoff window register does not match rt_submit'
+        )
+    if (
+        v04_shadow_publication and
+        rt_publish_trace_context_line.args[16] != str(rtcore_abi_v04.LANE_SLOT_BYTES)
+    ):
+        rtcore_raise_compiler_lowering_contract_violation(
+            'rt_publish_trace_context V0.4 handoff backing size is not the '
+            'generated lane-slot size'
         )
 
 
@@ -1708,8 +1721,9 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 handoff_window_offset_init,
                 handoff_window_base_add,
             ] + continuation_setup
+            v04_shadow_trace_input_lines = []
             if v04_shadow_publication:
-                trace_submit_setup.extend(
+                v04_shadow_trace_input_lines = (
                     rtcore_v04_shadow_trace_input_publication_lines(
                         line.leadingWhiteSpace,
                         trace_ray_condition,
@@ -1741,28 +1755,37 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             if rtcore_compiler_driver_publication_source_enabled():
                 rt_publish_trace_context_line = PTXFunctionalLine()
                 rt_publish_trace_context_line.leadingWhiteSpace = line.leadingWhiteSpace
+                rt_publish_trace_context_args = (
+                    context_ptr_reg,
+                    handoff_window_base_reg,
+                    topLevelAS,
+                    rayFlags,
+                    cullMask,
+                    sbtRecordOffset,
+                    sbtRecordStride,
+                    missIndex,
+                    originRegNames[0],
+                    originRegNames[1],
+                    originRegNames[2],
+                    Tmin,
+                    directionRegNames[0],
+                    directionRegNames[1],
+                    directionRegNames[2],
+                    Tmax,
+                )
+                if v04_shadow_publication:
+                    rt_publish_trace_context_args += (
+                        str(rtcore_abi_v04.LANE_SLOT_BYTES),
+                    )
                 rt_publish_trace_context_line.buildString(
                     FunctionalType.rt_publish_trace_context,
-                    (
-                        context_ptr_reg,
-                        handoff_window_base_reg,
-                        topLevelAS,
-                        rayFlags,
-                        cullMask,
-                        sbtRecordOffset,
-                        sbtRecordStride,
-                        missIndex,
-                        originRegNames[0],
-                        originRegNames[1],
-                        originRegNames[2],
-                        Tmin,
-                        directionRegNames[0],
-                        directionRegNames[1],
-                        directionRegNames[2],
-                        Tmax,
-                    ),
+                    rt_publish_trace_context_args,
                 )
-                trace_ray_lines = [rt_publish_trace_context_line, rt_submit_line]
+                trace_ray_lines = (
+                    [rt_publish_trace_context_line] +
+                    v04_shadow_trace_input_lines +
+                    [rt_submit_line]
+                )
             rtcore_copy_trace_ray_condition(
                 trace_ray_condition,
                 trace_ray_line=trace_ray_line,
@@ -1775,6 +1798,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 rt_publish_trace_context_line,
                 context_ptr_reg,
                 handoff_window_base_reg,
+                v04_shadow_publication,
             )
             continuation_anchor_label_str = (
                 'rt_continuation_anchor_' + str(trace_ray_ID)
