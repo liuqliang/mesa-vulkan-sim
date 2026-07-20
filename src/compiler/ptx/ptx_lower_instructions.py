@@ -138,6 +138,20 @@ RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION_ENV = (
 RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER_ENV = (
     'VULKAN_SIM_RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER'
 )
+RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS = (
+    (
+        FunctionalType.load_ray_instance_custom_index,
+        'load_ray_instance_custom_index',
+        'InstanceCustomIndex',
+        'instance_custom_index',
+    ),
+    (
+        FunctionalType.load_primitive_id,
+        'load_primitive_id',
+        'PrimitiveId',
+        'primitive_index',
+    ),
+)
 
 
 def rtcore_env_flag_enabled(name):
@@ -2665,13 +2679,17 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
         return
 
     for line in ptx_shader.lines:
-        if re.match(
-            r'^@!?\S+\s+load_ray_instance_custom_index(?:\s|;|$)',
-            line.command,
+        for _, opcode, display_name, _ in (
+            RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS
         ):
-            raise ValueError(
-                'predicated V0.4 InstanceCustomIndex consumer is unsupported'
-            )
+            if re.match(
+                r'^@!?\S+\s+' + re.escape(opcode) + r'(?:\s|;|$)',
+                line.command,
+            ):
+                raise ValueError(
+                    'predicated V0.4 %s consumer is unsupported' %
+                    display_name
+                )
 
     shader_type = ptx_shader.getShaderType()
     supported_shader_types = (
@@ -2679,30 +2697,33 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
         ShaderType.Any_hit,
         ShaderType.Intersection,
     )
-    instance_custom_index_offset = rtcore_v04_direct_field_byte_offset(
-        'instance_custom_index'
-    )
+    builtin_specs = {
+        functional_type: (display_name, field_name)
+        for functional_type, _, display_name, field_name in
+        RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS
+    }
 
     for index, line in enumerate(ptx_shader.lines):
-        if (
-            line.instructionClass != InstructionClass.Functional or
-            line.functionalType !=
-                FunctionalType.load_ray_instance_custom_index
-        ):
+        if line.instructionClass != InstructionClass.Functional:
             continue
+        builtin_spec = builtin_specs.get(line.functionalType)
+        if builtin_spec is None:
+            continue
+        display_name, field_name = builtin_spec
         if shader_type not in supported_shader_types:
             raise ValueError(
-                'V0.4 InstanceCustomIndex consumer is invalid for shader %s' %
-                shader_type
+                'V0.4 %s consumer is invalid for shader %s' %
+                (display_name, shader_type)
             )
         if len(line.args) != 1:
             raise ValueError(
-                'V0.4 InstanceCustomIndex consumer requires one destination'
+                'V0.4 %s consumer requires one destination' % display_name
             )
         if line.condition:
             raise ValueError(
-                'predicated V0.4 InstanceCustomIndex consumer is unsupported'
+                'predicated V0.4 %s consumer is unsupported' % display_name
             )
+        field_offset = rtcore_v04_direct_field_byte_offset(field_name)
         load = PTXFunctionalLine()
         load.leadingWhiteSpace = line.leadingWhiteSpace
         load.comment = line.comment
@@ -2711,7 +2732,7 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
             (
                 line.args[0],
                 rtcore_v04_handoff_word_address(
-                    '%rt_handoff_lane_ptr', instance_custom_index_offset
+                    '%rt_handoff_lane_ptr', field_offset
                 ),
             ),
         )

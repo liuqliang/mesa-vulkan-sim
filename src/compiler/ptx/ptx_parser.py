@@ -251,6 +251,7 @@ class FunctionalType(Enum, metaclass=MetaEnum):
     load_ray_world_direction = 'load_ray_world_direction'
     load_ray_world_origin = 'load_ray_world_origin'
     load_ray_instance_custom_index = 'load_ray_instance_custom_index'
+    load_primitive_id = 'load_primitive_id'
     fpow = 'fpow'
     flrp = 'flrp'
     bra = 'bra'
