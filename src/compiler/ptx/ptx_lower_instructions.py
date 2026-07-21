@@ -240,6 +240,24 @@ RTCORE_V04_SUPPORTED_DIRECT_RAY_POLICY_BUILTINS = (
     ),
 )
 
+# The selected GEN_RT instance leaf stores the fourth matrix columns in the
+# opposite matrix's first cache line. Keep these offsets named and validate
+# them against the profile in the focused V0.4 transform probe.
+RTCORE_V04_INSTANCE_MATRIX_BUILTINS = (
+    (
+        FunctionalType.load_ray_world_to_object,
+        'load_ray_world_to_object',
+        'WorldToObject',
+        (16, 28, 40, 116),
+    ),
+    (
+        FunctionalType.load_ray_object_to_world,
+        'load_ray_object_to_world',
+        'ObjectToWorld',
+        (80, 92, 104, 52),
+    ),
+)
+
 
 def rtcore_env_flag_enabled(name):
     value = os.environ.get(name, '0')
@@ -2645,12 +2663,11 @@ def translate_decl_var(ptx_shader):
 
 
 def translate_load_GL_instructions(ptx_shader):
-    skip_lines = -1
-    for index in range(len(ptx_shader.lines)):
-        if index <= skip_lines:
-            continue
+    index = 0
+    while index < len(ptx_shader.lines):
         line = ptx_shader.lines[index]
         if line.instructionClass != InstructionClass.Functional:
+            index += 1
             continue
 
         if line.functionalType == FunctionalType.load_ray_launch_id or line.functionalType == FunctionalType.load_ray_launch_size:
@@ -2686,6 +2703,7 @@ def translate_load_GL_instructions(ptx_shader):
             # ptx_shader.lines.insert(index + 5, loadZero)
             # ptx_shader.lines[index + 6: index + 6] = wrapMovs[:3]
             # skip_lines = index + 7
+            index += 1
         
         
         elif line.functionalType == FunctionalType.load_ray_world_to_object or line.functionalType == FunctionalType.load_ray_object_to_world:
@@ -2701,7 +2719,9 @@ def translate_load_GL_instructions(ptx_shader):
 
             offset = 0
             loads = []
-            for regNames in newRegNames:
+            # PTX represents a NIR vec3 in padded .v4 storage. Only the first
+            # three lanes are semantic matrix components.
+            for regNames in newRegNames[:3]:
                 newLoad = PTXFunctionalLine()
                 newLoad.leadingWhiteSpace = line.leadingWhiteSpace
                 newLoad.buildString('ld.global.f32', (regNames, '[' + address_reg + ' + ' + str(offset) + ']'))
@@ -2710,9 +2730,9 @@ def translate_load_GL_instructions(ptx_shader):
 
             line.buildString(line.functionalType, [address_reg, loadIndex, ])
 
-            ptx_shader.lines[index:index + 1] = [address_declaration, line] + loads
-
-            skip_lines = index + 2
+            replacement = [address_declaration, line] + loads
+            ptx_shader.lines[index:index + 1] = replacement
+            index += len(replacement)
         elif line.functionalType == FunctionalType.load_ray_world_direction:
             dst = line.args[0]
 
@@ -2734,9 +2754,9 @@ def translate_load_GL_instructions(ptx_shader):
 
             line.buildString(line.functionalType, (address_reg, ))
 
-            ptx_shader.lines[index:index + 1] = [address_declaration, line] + loads
-
-            skip_lines = index + 2
+            replacement = [address_declaration, line] + loads
+            ptx_shader.lines[index:index + 1] = replacement
+            index += len(replacement)
         
 
         elif line.functionalType == FunctionalType.load_ray_world_origin:
@@ -2760,9 +2780,11 @@ def translate_load_GL_instructions(ptx_shader):
             
             line.buildString(line.functionalType, (address_reg, ))
 
-            ptx_shader.lines[index:index + 1] = [address_declaration, line] + loads
-
-            skip_lines = index + 2
+            replacement = [address_declaration, line] + loads
+            ptx_shader.lines[index:index + 1] = replacement
+            index += len(replacement)
+        else:
+            index += 1
 
 
 
@@ -2778,6 +2800,7 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
         RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS,
         RTCORE_V04_SUPPORTED_DIRECT_RAY_GEOMETRY_BUILTINS,
         RTCORE_V04_SUPPORTED_DIRECT_RAY_POLICY_BUILTINS,
+        RTCORE_V04_INSTANCE_MATRIX_BUILTINS,
     )
     for line in ptx_shader.lines:
         for spec in tuple(
@@ -2813,8 +2836,14 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
         )
         for functional_type, _, display_name, shape, field_names in table
     }
+    matrix_builtin_specs = {
+        functional_type: (display_name, column_offsets)
+        for functional_type, _, display_name, column_offsets in
+        RTCORE_V04_INSTANCE_MATRIX_BUILTINS
+    }
 
     index = 0
+    matrix_consumer_id = 0
     while index < len(ptx_shader.lines):
         line = ptx_shader.lines[index]
         if line.instructionClass != InstructionClass.Functional:
@@ -2822,8 +2851,99 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
             continue
         hit_builtin_spec = hit_builtin_specs.get(line.functionalType)
         ray_builtin_spec = ray_builtin_specs.get(line.functionalType)
-        if hit_builtin_spec is None and ray_builtin_spec is None:
+        matrix_builtin_spec = matrix_builtin_specs.get(line.functionalType)
+        if (
+            hit_builtin_spec is None and ray_builtin_spec is None and
+            matrix_builtin_spec is None
+        ):
             index += 1
+            continue
+        if matrix_builtin_spec is not None:
+            display_name, column_offsets = matrix_builtin_spec
+            if shader_type not in RTCORE_V04_HIT_IDENTITY_SHADER_TYPES:
+                raise ValueError(
+                    'V0.4 %s consumer is invalid for shader %s' %
+                    (display_name, shader_type)
+                )
+            if len(line.args) != 2:
+                raise ValueError(
+                    'V0.4 %s consumer requires destination and column' %
+                    display_name
+                )
+            if line.condition:
+                raise ValueError(
+                    'predicated V0.4 %s consumer is unsupported' %
+                    display_name
+                )
+            column = rtcore_v04_unsigned_integer_literal(line.args[1])
+            if column is None:
+                raise ValueError(
+                    'V0.4 %s consumer requires a literal column' %
+                    display_name
+                )
+            if column < 0 or column >= len(column_offsets):
+                raise ValueError(
+                    'V0.4 %s consumer column %d is outside 0..3' %
+                    (display_name, column)
+                )
+            declaration, _ = ptx_shader.findDeclaration(line.args[0])
+            if (
+                declaration is None or not declaration.isVector() or
+                declaration.vectorSize() < 3 or declaration.vectorSize() > 4 or
+                declaration.variableType != '.f32'
+            ):
+                raise ValueError(
+                    'V0.4 %s consumer requires a float vector destination' %
+                    display_name
+                )
+
+            metadata_ref_reg = (
+                '%%rt_v04_instance_metadata_ref_%u' % matrix_consumer_id
+            )
+            matrix_consumer_id += 1
+            metadata_ref_declaration = PTXDecleration()
+            metadata_ref_declaration.leadingWhiteSpace = line.leadingWhiteSpace
+            metadata_ref_declaration.buildString(
+                DeclarationType.Register, None, '.b64', metadata_ref_reg
+            )
+            metadata_ref_load = PTXFunctionalLine()
+            metadata_ref_load.leadingWhiteSpace = line.leadingWhiteSpace
+            metadata_ref_load.comment = line.comment
+            metadata_ref_load.buildString(
+                'ld.global.u64',
+                (
+                    metadata_ref_reg,
+                    rtcore_v04_handoff_word_address(
+                        '%rt_handoff_lane_ptr',
+                        rtcore_v04_u64_field_byte_offset(
+                            'instance_metadata_reference_low32',
+                            'instance_metadata_reference_high32',
+                        ),
+                    ),
+                ),
+            )
+            matrix_loads = []
+            column_offset = column_offsets[column]
+            for component in range(3):
+                matrix_load = PTXFunctionalLine()
+                matrix_load.leadingWhiteSpace = line.leadingWhiteSpace
+                matrix_load.buildString(
+                    'ld.global.f32',
+                    (
+                        '%s_%u' % (line.args[0], component),
+                        rtcore_v04_handoff_word_address(
+                            metadata_ref_reg,
+                            column_offset + component * 4,
+                        ),
+                    ),
+                )
+                matrix_loads.append(matrix_load)
+            replacement = [
+                metadata_ref_declaration,
+                metadata_ref_load,
+            ] + matrix_loads
+            ptx_shader.lines[index:index + 1] = replacement
+            index += len(replacement)
             continue
         if hit_builtin_spec is not None:
             display_name, field_name = hit_builtin_spec
