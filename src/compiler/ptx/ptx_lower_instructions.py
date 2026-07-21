@@ -223,6 +223,22 @@ RTCORE_V04_RAY_TMAX_FIELD_BY_SHADER = {
     ShaderType.Any_hit: 'boundary_ray_tmax_fp32',
     ShaderType.Intersection: 'boundary_ray_tmax_fp32',
 }
+RTCORE_V04_SUPPORTED_DIRECT_RAY_POLICY_BUILTINS = (
+    (
+        FunctionalType.load_ray_flags,
+        'load_ray_flags',
+        'IncomingRayFlags',
+        'scalar_u32',
+        ('ray_flags',),
+    ),
+    (
+        FunctionalType.load_ray_cull_mask,
+        'load_ray_cull_mask',
+        'CullMask',
+        'masked_scalar_u32',
+        ('cull_mask',),
+    ),
+)
 
 
 def rtcore_env_flag_enabled(name):
@@ -2761,6 +2777,7 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
     supported_tables = (
         RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS,
         RTCORE_V04_SUPPORTED_DIRECT_RAY_GEOMETRY_BUILTINS,
+        RTCORE_V04_SUPPORTED_DIRECT_RAY_POLICY_BUILTINS,
     )
     for line in ptx_shader.lines:
         for spec in tuple(
@@ -2790,8 +2807,11 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
     }
     ray_builtin_specs = {
         functional_type: (display_name, shape, field_names)
-        for functional_type, _, display_name, shape, field_names in
-        RTCORE_V04_SUPPORTED_DIRECT_RAY_GEOMETRY_BUILTINS
+        for table in (
+            RTCORE_V04_SUPPORTED_DIRECT_RAY_GEOMETRY_BUILTINS,
+            RTCORE_V04_SUPPORTED_DIRECT_RAY_POLICY_BUILTINS,
+        )
+        for functional_type, _, display_name, shape, field_names in table
     }
 
     index = 0
