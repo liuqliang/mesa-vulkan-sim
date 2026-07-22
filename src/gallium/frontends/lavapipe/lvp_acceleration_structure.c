@@ -1359,7 +1359,7 @@ lvp_cpu_build_acceleration_structures(
       }
       assert(!root->is_leaf);
 
-      UNUSED uint32_t root_type, root_size;
+      uint32_t root_type, root_size;
       node_type_size(root, &root_type, &root_size, &build_state);
 
       void *dst_map = (uint8_t *)dst_accel->address.bo + dst_accel->address.offset;
@@ -1387,6 +1387,9 @@ lvp_cpu_build_acceleration_structures(
       build_state.nodes_map = root_map + root_size * 64;
       pack_node(root, true, root_map, &build_state);
       printf("EMBREE: Pack root %p to root_map %p\n", root, root_map);
+      if (pInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+         gpgpusim_publishBLASRootDescriptor(
+            dst_accel, bvh.RootNodeOffset, root_type);
       if (pInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)
          gpgpusim_addTreelets(dst_map);
 

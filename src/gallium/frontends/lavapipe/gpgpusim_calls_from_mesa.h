@@ -44,6 +44,9 @@ extern void gpgpusim_allocBLAS(void* objectKey, void* rootAddr,
                               uint64_t bufferSize, void* gpgpusimAddr);
 extern void gpgpusim_releaseBLAS(void* objectKey, void* rootAddr,
                                 void* gpgpusimAddr);
+extern void gpgpusim_publishBLASRootDescriptor(void* objectKey,
+                                               uint64_t rootPayloadOffset,
+                                               uint32_t rootPayloadKind);
 extern void gpgpusim_allocTLAS(void* objectKey, void* rootAddr,
                               uint64_t bufferSize, void* gpgpusimAddr);
 extern void gpgpusim_releaseTLAS(void* objectKey, void* rootAddr,
