@@ -257,6 +257,32 @@ RTCORE_V04_INSTANCE_MATRIX_BUILTINS = (
         (80, 92, 104, 52),
     ),
 )
+RTCORE_OBJECT_RAY_BUILTINS = (
+    (
+        FunctionalType.load_ray_object_origin,
+        'load_ray_object_origin',
+        'ObjectRayOrigin',
+        FunctionalType.load_ray_world_origin,
+        (
+            'world_ray_origin_x_fp32',
+            'world_ray_origin_y_fp32',
+            'world_ray_origin_z_fp32',
+        ),
+        True,
+    ),
+    (
+        FunctionalType.load_ray_object_direction,
+        'load_ray_object_direction',
+        'ObjectRayDirection',
+        FunctionalType.load_ray_world_direction,
+        (
+            'world_ray_direction_x_fp32',
+            'world_ray_direction_y_fp32',
+            'world_ray_direction_z_fp32',
+        ),
+        False,
+    ),
+)
 
 
 def rtcore_env_flag_enabled(name):
@@ -2662,7 +2688,331 @@ def translate_decl_var(ptx_shader):
     #     break
 
 
+def rtcore_object_ray_register_declaration(line, variable_type, name):
+    declaration = PTXDecleration()
+    declaration.leadingWhiteSpace = line.leadingWhiteSpace
+    declaration.buildString(
+        DeclarationType.Register, None, variable_type, name
+    )
+    return declaration
+
+
+def rtcore_object_ray_instruction(line, opcode, args, copy_comment=False):
+    instruction = PTXFunctionalLine()
+    instruction.leadingWhiteSpace = line.leadingWhiteSpace
+    if copy_comment:
+        instruction.comment = line.comment
+    instruction.buildString(opcode, args)
+    return instruction
+
+
+def rtcore_validate_object_ray_consumer(ptx_shader, line, display_name):
+    if len(line.args) != 1:
+        raise ValueError(
+            '%s consumer requires one destination' % display_name
+        )
+    if line.condition:
+        raise ValueError(
+            'predicated %s consumer is unsupported' % display_name
+        )
+    shader_type = ptx_shader.getShaderType()
+    if shader_type not in RTCORE_V04_HIT_IDENTITY_SHADER_TYPES:
+        raise ValueError(
+            '%s consumer is invalid for shader %s' %
+            (display_name, shader_type)
+        )
+    declaration, _ = ptx_shader.findDeclaration(line.args[0])
+    if (
+        declaration is None or not declaration.isVector() or
+        declaration.vectorSize() < 3 or declaration.vectorSize() > 4 or
+        declaration.variableType != '.f32'
+    ):
+        raise ValueError(
+            '%s consumer requires a float vector destination' % display_name
+        )
+    return ['%s_%u' % (line.args[0], component) for component in range(3)]
+
+
+def rtcore_build_object_ray_transform(
+        line, destination_regs, world_regs, matrix_regs, prefix,
+        include_translation):
+    declarations = []
+    instructions = []
+    for component, destination in enumerate(destination_regs):
+        product_reg = '%s_product_%u' % (prefix, component)
+        accumulator_reg = '%s_accumulator_%u' % (prefix, component)
+        declarations.extend((
+            rtcore_object_ray_register_declaration(
+                line, '.f32', product_reg
+            ),
+            rtcore_object_ray_register_declaration(
+                line, '.f32', accumulator_reg
+            ),
+        ))
+        if include_translation:
+            instructions.extend((
+                rtcore_object_ray_instruction(
+                    line,
+                    'mul.f32',
+                    (product_reg, matrix_regs[0][component], world_regs[0]),
+                ),
+                rtcore_object_ray_instruction(
+                    line,
+                    'add.f32',
+                    (
+                        accumulator_reg,
+                        matrix_regs[3][component],
+                        product_reg,
+                    ),
+                ),
+            ))
+        else:
+            instructions.append(
+                rtcore_object_ray_instruction(
+                    line,
+                    'mul.f32',
+                    (
+                        accumulator_reg,
+                        matrix_regs[0][component],
+                        world_regs[0],
+                    ),
+                )
+            )
+        instructions.extend((
+            rtcore_object_ray_instruction(
+                line,
+                'mul.f32',
+                (product_reg, matrix_regs[1][component], world_regs[1]),
+            ),
+            rtcore_object_ray_instruction(
+                line,
+                'add.f32',
+                (accumulator_reg, accumulator_reg, product_reg),
+            ),
+            rtcore_object_ray_instruction(
+                line,
+                'mul.f32',
+                (product_reg, matrix_regs[2][component], world_regs[2]),
+            ),
+            rtcore_object_ray_instruction(
+                line,
+                'add.f32',
+                (destination, accumulator_reg, product_reg),
+            ),
+        ))
+    return declarations + instructions
+
+
+def rtcore_build_legacy_object_ray_replacement(
+        ptx_shader, line, consumer_id, spec):
+    display_name, legacy_world_opcode, _, include_translation = spec
+    destination_regs = rtcore_validate_object_ray_consumer(
+        ptx_shader, line, display_name
+    )
+    prefix = '%%rt_compat_object_ray_%u' % consumer_id
+    world_address_reg = '%s_world_address' % prefix
+    world_regs = [
+        '%s_world_%u' % (prefix, component) for component in range(3)
+    ]
+    column_count = 4 if include_translation else 3
+    matrix_address_regs = [
+        '%s_matrix_address_%u' % (prefix, column)
+        for column in range(column_count)
+    ]
+    matrix_regs = [
+        [
+            '%s_matrix_%u_%u' % (prefix, column, component)
+            for component in range(3)
+        ]
+        for column in range(column_count)
+    ]
+    declarations = [
+        rtcore_object_ray_register_declaration(
+            line, '.b64', world_address_reg
+        )
+    ]
+    declarations.extend(
+        rtcore_object_ray_register_declaration(line, '.f32', register)
+        for register in world_regs
+    )
+    for column in range(column_count):
+        declarations.append(
+            rtcore_object_ray_register_declaration(
+                line, '.b64', matrix_address_regs[column]
+            )
+        )
+        declarations.extend(
+            rtcore_object_ray_register_declaration(line, '.f32', register)
+            for register in matrix_regs[column]
+        )
+
+    source_loads = [
+        rtcore_object_ray_instruction(
+            line,
+            legacy_world_opcode,
+            (world_address_reg,),
+            copy_comment=True,
+        )
+    ]
+    source_loads.extend(
+        rtcore_object_ray_instruction(
+            line,
+            'ld.global.f32',
+            (
+                world_regs[component],
+                '[%s + %u]' % (world_address_reg, component * 4),
+            ),
+        )
+        for component in range(3)
+    )
+    for column in range(column_count):
+        source_loads.append(
+            rtcore_object_ray_instruction(
+                line,
+                FunctionalType.load_ray_world_to_object,
+                (matrix_address_regs[column], str(column)),
+            )
+        )
+        source_loads.extend(
+            rtcore_object_ray_instruction(
+                line,
+                'ld.global.f32',
+                (
+                    matrix_regs[column][component],
+                    '[%s + %u]' %
+                    (matrix_address_regs[column], component * 4),
+                ),
+            )
+            for component in range(3)
+        )
+    transform = rtcore_build_object_ray_transform(
+        line,
+        destination_regs,
+        world_regs,
+        matrix_regs,
+        prefix,
+        include_translation,
+    )
+    return declarations + source_loads + transform
+
+
+def rtcore_build_v04_object_ray_replacement(
+        ptx_shader, line, consumer_id, spec):
+    display_name, _, world_field_names, include_translation = spec
+    destination_regs = rtcore_validate_object_ray_consumer(
+        ptx_shader, line, 'V0.4 %s' % display_name
+    )
+    prefix = '%%rt_v04_object_ray_%u' % consumer_id
+    metadata_ref_reg = '%s_instance_metadata_ref' % prefix
+    world_regs = [
+        '%s_world_%u' % (prefix, component) for component in range(3)
+    ]
+    column_count = 4 if include_translation else 3
+    matrix_regs = [
+        [
+            '%s_matrix_%u_%u' % (prefix, column, component)
+            for component in range(3)
+        ]
+        for column in range(column_count)
+    ]
+    declarations = [
+        rtcore_object_ray_register_declaration(
+            line, '.b64', metadata_ref_reg
+        )
+    ]
+    declarations.extend(
+        rtcore_object_ray_register_declaration(line, '.f32', register)
+        for register in world_regs
+    )
+    declarations.extend(
+        rtcore_object_ray_register_declaration(line, '.f32', register)
+        for column in matrix_regs for register in column
+    )
+    source_loads = [
+        rtcore_object_ray_instruction(
+            line,
+            'ld.global.u64',
+            (
+                metadata_ref_reg,
+                rtcore_v04_handoff_word_address(
+                    '%rt_handoff_lane_ptr',
+                    rtcore_v04_u64_field_byte_offset(
+                        'instance_metadata_reference_low32',
+                        'instance_metadata_reference_high32',
+                    ),
+                ),
+            ),
+            copy_comment=True,
+        )
+    ]
+    source_loads.extend(
+        rtcore_object_ray_instruction(
+            line,
+            'ld.global.f32',
+            (
+                world_regs[component],
+                rtcore_v04_handoff_word_address(
+                    '%rt_handoff_lane_ptr',
+                    rtcore_v04_direct_field_byte_offset(field_name),
+                ),
+            ),
+        )
+        for component, field_name in enumerate(world_field_names)
+    )
+    world_to_object_offsets = RTCORE_V04_INSTANCE_MATRIX_BUILTINS[0][3]
+    for column in range(column_count):
+        for component in range(3):
+            source_loads.append(
+                rtcore_object_ray_instruction(
+                    line,
+                    'ld.global.f32',
+                    (
+                        matrix_regs[column][component],
+                        rtcore_v04_handoff_word_address(
+                            metadata_ref_reg,
+                            world_to_object_offsets[column] + component * 4,
+                        ),
+                    ),
+                )
+            )
+    transform = rtcore_build_object_ray_transform(
+        line,
+        destination_regs,
+        world_regs,
+        matrix_regs,
+        prefix,
+        include_translation,
+    )
+    return declarations + source_loads + transform
+
+
 def translate_load_GL_instructions(ptx_shader):
+    for line in ptx_shader.lines:
+        for _, opcode, display_name, _, _, _ in RTCORE_OBJECT_RAY_BUILTINS:
+            if re.match(
+                r'^@!?\S+\s+' + re.escape(opcode) + r'(?:\s|;|$)',
+                line.command,
+            ):
+                raise ValueError(
+                    'predicated %s consumer is unsupported' % display_name
+                )
+    object_ray_specs = {
+        functional_type: (
+            display_name,
+            legacy_world_opcode,
+            world_field_names,
+            include_translation,
+        )
+        for (
+            functional_type,
+            _,
+            display_name,
+            legacy_world_opcode,
+            world_field_names,
+            include_translation,
+        ) in RTCORE_OBJECT_RAY_BUILTINS
+    }
+    object_ray_consumer_id = 0
     index = 0
     while index < len(ptx_shader.lines):
         line = ptx_shader.lines[index]
@@ -2670,7 +3020,15 @@ def translate_load_GL_instructions(ptx_shader):
             index += 1
             continue
 
-        if line.functionalType == FunctionalType.load_ray_launch_id or line.functionalType == FunctionalType.load_ray_launch_size:
+        object_ray_spec = object_ray_specs.get(line.functionalType)
+        if object_ray_spec is not None:
+            replacement = rtcore_build_legacy_object_ray_replacement(
+                ptx_shader, line, object_ray_consumer_id, object_ray_spec
+            )
+            object_ray_consumer_id += 1
+            ptx_shader.lines[index:index + 1] = replacement
+            index += len(replacement)
+        elif line.functionalType == FunctionalType.load_ray_launch_id or line.functionalType == FunctionalType.load_ray_launch_size:
             dst = line.args[0]
 
             declaration, _ = ptx_shader.findDeclaration(dst)
@@ -2801,6 +3159,7 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
         RTCORE_V04_SUPPORTED_DIRECT_RAY_GEOMETRY_BUILTINS,
         RTCORE_V04_SUPPORTED_DIRECT_RAY_POLICY_BUILTINS,
         RTCORE_V04_INSTANCE_MATRIX_BUILTINS,
+        RTCORE_OBJECT_RAY_BUILTINS,
     )
     for line in ptx_shader.lines:
         for spec in tuple(
@@ -2841,9 +3200,26 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
         for functional_type, _, display_name, column_offsets in
         RTCORE_V04_INSTANCE_MATRIX_BUILTINS
     }
+    object_ray_builtin_specs = {
+        functional_type: (
+            display_name,
+            legacy_world_opcode,
+            world_field_names,
+            include_translation,
+        )
+        for (
+            functional_type,
+            _,
+            display_name,
+            legacy_world_opcode,
+            world_field_names,
+            include_translation,
+        ) in RTCORE_OBJECT_RAY_BUILTINS
+    }
 
     index = 0
     matrix_consumer_id = 0
+    object_ray_consumer_id = 0
     while index < len(ptx_shader.lines):
         line = ptx_shader.lines[index]
         if line.instructionClass != InstructionClass.Functional:
@@ -2852,11 +3228,25 @@ def translate_rt_shader_builtin_consumers(ptx_shader):
         hit_builtin_spec = hit_builtin_specs.get(line.functionalType)
         ray_builtin_spec = ray_builtin_specs.get(line.functionalType)
         matrix_builtin_spec = matrix_builtin_specs.get(line.functionalType)
+        object_ray_builtin_spec = object_ray_builtin_specs.get(
+            line.functionalType
+        )
         if (
             hit_builtin_spec is None and ray_builtin_spec is None and
-            matrix_builtin_spec is None
+            matrix_builtin_spec is None and object_ray_builtin_spec is None
         ):
             index += 1
+            continue
+        if object_ray_builtin_spec is not None:
+            replacement = rtcore_build_v04_object_ray_replacement(
+                ptx_shader,
+                line,
+                object_ray_consumer_id,
+                object_ray_builtin_spec,
+            )
+            object_ray_consumer_id += 1
+            ptx_shader.lines[index:index + 1] = replacement
+            index += len(replacement)
             continue
         if matrix_builtin_spec is not None:
             display_name, column_offsets = matrix_builtin_spec

@@ -2682,6 +2682,17 @@ print_intrinsic_instr_as_ptx(nir_intrinsic_instr *instr, print_state *state, ssa
       }
       fprintf(fp, "%s ", info->name); // Intrinsic function name
    }
+   else if (!strcmp(info->name, "load_ray_object_direction") ||
+            !strcmp(info->name, "load_ray_object_origin")){
+      if (info->has_dest) {
+         ssa_register_info[instr->dest.ssa.index].type = FLOAT;
+         print_ptx_reg_decl(state, instr->dest.ssa.num_components, FLOAT, instr->dest.ssa.bit_size);
+         print_dest_as_ptx_no_pos(&instr->dest, state);
+         fprintf(fp, ";\n");
+         print_tabs(tabs, fp);
+      }
+      fprintf(fp, "%s ", info->name); // Intrinsic function name
+   }
    else if (!strcmp(info->name, "load_ray_t_max")){
       if (info->has_dest) {
          ssa_register_info[instr->dest.ssa.index].type = FLOAT;
