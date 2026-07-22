@@ -133,6 +133,8 @@ struct lvp_bvh_build_state {
 
    void *nodes_map;
    void *leaves_map;
+   void *dst_accel_object_key;
+   bool publish_instance_blas_references;
 };
 
 // static struct lvp_bo *
@@ -1112,6 +1114,9 @@ pack_node(struct vsim_bvh_node *node, bool is_root, void *out,
          bil.ObjectToWorldm32 = o2w4x4[11];
 
          GEN_RT_BVH_INSTANCE_LEAF_pack(NULL, out, &bil);
+         if (state->publish_instance_blas_references)
+            gpgpusim_publishTLASInstanceReference(
+               state->dst_accel_object_key, out, child_map);
          break;
       }
 
@@ -1204,6 +1209,9 @@ lvp_cpu_build_acceleration_structures(
       struct lvp_bvh_build_state build_state = {
          .device = device,
          .is_host_build = is_host_build,
+         .dst_accel_object_key = dst_accel,
+         .publish_instance_blas_references =
+            pInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
       };
 
       uint64_t total_prim_count = 0;
@@ -1385,7 +1393,11 @@ lvp_cpu_build_acceleration_structures(
 
       void *root_map = dst_map + bvh.RootNodeOffset;
       build_state.nodes_map = root_map + root_size * 64;
+      if (build_state.publish_instance_blas_references)
+         gpgpusim_beginTLASInstanceReferences(dst_accel);
       pack_node(root, true, root_map, &build_state);
+      if (build_state.publish_instance_blas_references)
+         gpgpusim_endTLASInstanceReferences(dst_accel);
       printf("EMBREE: Pack root %p to root_map %p\n", root, root_map);
       if (pInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
          gpgpusim_publishBLASRootDescriptor(
