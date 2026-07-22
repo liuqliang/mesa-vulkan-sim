@@ -267,8 +267,9 @@ lvp_CreateAccelerationStructureKHR(
                          accel->size, gpgpusim_accel_address);
    }
    else {
-      gpgpusim_allocBLAS((void *)accel->address.bo + accel->address.offset,
-                         buffer->total_size, gpgpusim_accel_address);
+      gpgpusim_allocBLAS(accel,
+                         (void *)accel->address.bo + accel->address.offset,
+                         accel->size, gpgpusim_accel_address);
    }
 
    return VK_SUCCESS;
@@ -289,6 +290,12 @@ lvp_DestroyAccelerationStructureKHR(
 
    if (accel->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
       gpgpusim_releaseTLAS(
+         accel,
+         (void *)accel->address.bo + accel->address.offset,
+         accel->gpgpusim_address);
+   }
+   else {
+      gpgpusim_releaseBLAS(
          accel,
          (void *)accel->address.bo + accel->address.offset,
          accel->gpgpusim_address);
