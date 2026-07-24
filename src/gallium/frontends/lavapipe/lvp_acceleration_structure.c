@@ -1402,8 +1402,11 @@ lvp_cpu_build_acceleration_structures(
       if (pInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
          gpgpusim_publishBLASRootDescriptor(
             dst_accel, bvh.RootNodeOffset, root_type);
-      if (pInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)
+      if (pInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
+         gpgpusim_publishTLASRootDescriptor(
+            dst_accel, bvh.RootNodeOffset, root_type);
          gpgpusim_addTreelets(dst_map);
+      }
 
       rtcReleaseBVH(rtc_bvh);
       MESA_VSIM_DPRINTF("EMBREE: Release rtcBVH structure created at %p\n", rtc_bvh);

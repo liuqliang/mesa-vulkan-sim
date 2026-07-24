@@ -47,6 +47,9 @@ extern void gpgpusim_releaseBLAS(void* objectKey, void* rootAddr,
 extern void gpgpusim_publishBLASRootDescriptor(void* objectKey,
                                                uint64_t rootPayloadOffset,
                                                uint32_t rootPayloadKind);
+extern void gpgpusim_publishTLASRootDescriptor(void* objectKey,
+                                               uint64_t rootPayloadOffset,
+                                               uint32_t rootPayloadKind);
 extern void gpgpusim_beginTLASInstanceReferences(void* objectKey);
 extern void gpgpusim_publishTLASInstanceReference(
    void* objectKey, void* instanceLeafAddress, const void* blasRootAddress);
