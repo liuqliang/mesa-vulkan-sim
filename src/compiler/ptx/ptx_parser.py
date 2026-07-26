@@ -274,6 +274,7 @@ class FunctionalType(Enum, metaclass=MetaEnum):
     shader_clock = 'shader_clock'
     report_ray_intersection = 'report_ray_intersection'
     ignore_ray_intersection = 'ignore_ray_intersection'
+    terminate_ray = 'terminate_ray'
     fsat = 'fsat'
     # get_intersection_index = 'get_intersection_index'
     run_intersection = 'run_intersection'

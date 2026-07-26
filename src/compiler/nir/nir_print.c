@@ -2738,6 +2738,9 @@ print_intrinsic_instr_as_ptx(nir_intrinsic_instr *instr, print_state *state, ssa
    else if (!strcmp(info->name, "ignore_ray_intersection")){
       fprintf(fp, "%s ", info->name); // Intrinsic function name
    }
+   else if (!strcmp(info->name, "terminate_ray")){
+      fprintf(fp, "%s ", info->name); // Intrinsic function name
+   }
    else {
       fprintf(fp, "// Untranslated %s instruction. ", info->name);
    }

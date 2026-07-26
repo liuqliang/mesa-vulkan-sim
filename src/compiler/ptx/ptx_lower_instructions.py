@@ -2053,7 +2053,9 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             if v04_continuation_lifecycle:
                 continuation_predicates.extend([
                     '%rt_anyhit_terminate_' + continuation_suffix,
+                    '%rt_anyhit_not_terminate_' + continuation_suffix,
                     '%rt_intersection_terminate_' + continuation_suffix,
+                    '%rt_intersection_not_terminate_' + continuation_suffix,
                 ])
             continuation_declarations = [
                 PTXLine.createNewLine(
@@ -2085,12 +2087,18 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             )
             anyhit_accept_pred = '%rt_anyhit_accept_' + continuation_suffix
             anyhit_terminate_pred = '%rt_anyhit_terminate_' + continuation_suffix
+            anyhit_not_terminate_pred = (
+                '%rt_anyhit_not_terminate_' + continuation_suffix
+            )
             anyhit_ignore_pred = '%rt_anyhit_ignore_' + continuation_suffix
             anyhit_valid_pred = '%rt_anyhit_result_valid_' + continuation_suffix
             intersection_none_pred = '%rt_intersection_none_' + continuation_suffix
             intersection_reported_pred = '%rt_intersection_reported_' + continuation_suffix
             intersection_terminate_pred = (
                 '%rt_intersection_terminate_' + continuation_suffix
+            )
+            intersection_not_terminate_pred = (
+                '%rt_intersection_not_terminate_' + continuation_suffix
             )
             intersection_valid_pred = '%rt_intersection_result_valid_' + continuation_suffix
             anyhit_resume_pred = '%rt_anyhit_resume_' + continuation_suffix
@@ -2136,6 +2144,8 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 *([
                     'setp.eq.u32 %s, %s, 5;' % (
                         anyhit_terminate_pred, hit_result_reg),
+                    'setp.ne.u32 %s, %s, 5;' % (
+                        anyhit_not_terminate_pred, hit_result_reg),
                     'or.pred %s, %s, %s;' % (
                         anyhit_accept_pred, anyhit_accept_pred,
                         anyhit_terminate_pred),
@@ -2155,6 +2165,8 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 *([
                     'setp.eq.u32 %s, %s, 6;' % (
                         intersection_terminate_pred, hit_result_reg),
+                    'setp.ne.u32 %s, %s, 6;' % (
+                        intersection_not_terminate_pred, hit_result_reg),
                     'or.pred %s, %s, %s;' % (
                         intersection_reported_pred,
                         intersection_reported_pred,
@@ -2166,9 +2178,20 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 'and.pred %s, %s, %s;' % (
                     anyhit_resume_pred, anyhit_reason_pred,
                     anyhit_valid_pred),
+                *([
+                    'and.pred %s, %s, %s;' % (
+                        anyhit_resume_pred, anyhit_resume_pred,
+                        anyhit_not_terminate_pred),
+                ] if v04_continuation_lifecycle else []),
                 'and.pred %s, %s, %s;' % (
                     intersection_resume_pred, intersection_reason_pred,
                     intersection_valid_pred),
+                *([
+                    'and.pred %s, %s, %s;' % (
+                        intersection_resume_pred,
+                        intersection_resume_pred,
+                        intersection_not_terminate_pred),
+                ] if v04_continuation_lifecycle else []),
                 'or.pred %s, %s, %s;' % (
                     should_resubmit_pred, anyhit_resume_pred,
                     intersection_resume_pred),
@@ -3549,6 +3572,14 @@ def translate_rt_shader_return_epilogue(ptx_shader):
     )
     v04_builtin_consumer = rtcore_v04_shader_builtin_consumer_enabled()
     if not rtcore_symbolic_submit_enabled():
+        if any(
+            getattr(line, 'functionalType', None)
+            == FunctionalType.terminate_ray
+            for line in ptx_shader.lines
+        ):
+            raise ValueError(
+                'terminate_ray requires the symbolic RT submit path'
+            )
         return
     shader_type = ptx_shader.getShaderType()
     returns_to_rtcore = shader_type in (
@@ -3587,6 +3618,7 @@ def translate_rt_shader_return_epilogue(ptx_shader):
             raise ValueError('V0.4 traversal effects are not single-bit fields')
         commit_effect_value = commit_effect_spec[3]
         accepted_report_effect_value = accepted_report_effect_spec[3]
+        terminate_effect_value = terminate_effect_spec[3]
         return_effect_offset = effect_word * 4
         if shader_type == ShaderType.Intersection:
             reported_t_offset = rtcore_v04_direct_field_byte_offset(
@@ -3698,6 +3730,21 @@ def translate_rt_shader_return_epilogue(ptx_shader):
                 ))
             ptx_shader.lines[index + 1:index + 1] = inserted
             index += len(inserted)
+        elif functional_type == FunctionalType.terminate_ray:
+            replacement = [
+                PTXLine.createNewLine(
+                    line.leadingWhiteSpace +
+                    'mov.u32 %rt_hit_result, 5;\n'
+                )
+            ]
+            if v04_shadow_return_publication:
+                replacement.append(PTXLine.createNewLine(
+                    line.leadingWhiteSpace +
+                    'mov.u32 %%rt_v04_return_effect, %u;\n' %
+                    (commit_effect_value | terminate_effect_value)
+                ))
+            ptx_shader.lines[index:index + 1] = replacement
+            index += len(replacement) - 1
         elif functional_type == FunctionalType.report_ray_intersection:
             reported_predicate, reported_t, reported_hit_kind = line.args[:3]
             hit_result_move = PTXFunctionalLine()
@@ -3802,10 +3849,9 @@ def translate_rt_shader_return_epilogue(ptx_shader):
                         )
                     ),
                 ])
-                if not v04_continuation_lifecycle:
-                    epilogue.append(PTXLine.createNewLine(
-                        line.leadingWhiteSpace + 'membar.gl;\n'
-                    ))
+                epilogue.append(PTXLine.createNewLine(
+                    line.leadingWhiteSpace + 'membar.gl;\n'
+                ))
             ptx_shader.lines[index:index] = epilogue
             index += len(epilogue)
         index += 1
