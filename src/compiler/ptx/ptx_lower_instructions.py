@@ -138,6 +138,9 @@ RTCORE_ABI_V04_SHADOW_SHADER_RETURN_PUBLICATION_ENV = (
 RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER_ENV = (
     'VULKAN_SIM_RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER'
 )
+RTCORE_ABI_V04_CONTINUATION_LIFECYCLE_ENV = (
+    'VULKAN_SIM_RTCORE_ABI_V04_CONTINUATION_LIFECYCLE'
+)
 RTCORE_V04_SUPPORTED_DIRECT_HIT_BUILTINS = (
     (
         FunctionalType.load_ray_instance_custom_index,
@@ -459,6 +462,28 @@ def rtcore_v04_shader_builtin_consumer_enabled():
                 RTCORE_ABI_V04_SHADER_BUILTIN_CONSUMER_ENV,
                 RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV,
             )
+        )
+    return True
+
+
+def rtcore_v04_continuation_lifecycle_enabled():
+    raw_value = os.environ.get(RTCORE_ABI_V04_CONTINUATION_LIFECYCLE_ENV)
+    if raw_value is None or raw_value.strip().lower() in (
+        '', '0', 'false', 'off', 'no', 'disabled'
+    ):
+        return False
+    if raw_value.strip().lower() not in (
+        '1', 'true', 'on', 'yes', 'enabled'
+    ):
+        raise ValueError(
+            'invalid %s: %s' %
+            (RTCORE_ABI_V04_CONTINUATION_LIFECYCLE_ENV, raw_value)
+        )
+    if (not rtcore_v04_shadow_shader_return_publication_enabled() or
+            not rtcore_v04_shader_builtin_consumer_enabled()):
+        raise ValueError(
+            '%s requires V0.4 return publication and builtin consumer' %
+            RTCORE_ABI_V04_CONTINUATION_LIFECYCLE_ENV
         )
     return True
 
@@ -1575,6 +1600,9 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
         symbolic_rt_submit = rtcore_symbolic_submit_enabled()
         v04_shadow_publication = rtcore_v04_shadow_publication_enabled()
+        v04_continuation_lifecycle = (
+            rtcore_v04_continuation_lifecycle_enabled()
+        )
         trace_submit_setup = []
 
         topLevelAS, rayFlags, cullMask, sbtRecordOffset, sbtRecordStride, missIndex, origin, Tmin, direction, Tmax, payload = line.args
@@ -2022,6 +2050,11 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 '%rt_publication_dirty_' + continuation_suffix,
                 '%rt_round_publication_dirty_' + continuation_suffix,
             ]
+            if v04_continuation_lifecycle:
+                continuation_predicates.extend([
+                    '%rt_anyhit_terminate_' + continuation_suffix,
+                    '%rt_intersection_terminate_' + continuation_suffix,
+                ])
             continuation_declarations = [
                 PTXLine.createNewLine(
                     line.leadingWhiteSpace + '.reg .' + register_type + ' ' +
@@ -2051,10 +2084,14 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 '%rt_reason_terminal_shader_' + continuation_suffix
             )
             anyhit_accept_pred = '%rt_anyhit_accept_' + continuation_suffix
+            anyhit_terminate_pred = '%rt_anyhit_terminate_' + continuation_suffix
             anyhit_ignore_pred = '%rt_anyhit_ignore_' + continuation_suffix
             anyhit_valid_pred = '%rt_anyhit_result_valid_' + continuation_suffix
             intersection_none_pred = '%rt_intersection_none_' + continuation_suffix
             intersection_reported_pred = '%rt_intersection_reported_' + continuation_suffix
+            intersection_terminate_pred = (
+                '%rt_intersection_terminate_' + continuation_suffix
+            )
             intersection_valid_pred = '%rt_intersection_result_valid_' + continuation_suffix
             anyhit_resume_pred = '%rt_anyhit_resume_' + continuation_suffix
             intersection_resume_pred = '%rt_intersection_resume_' + continuation_suffix
@@ -2087,20 +2124,42 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 'or.pred %s, %s, %s;' % (
                     terminal_shader_reason_pred, miss_reason_pred,
                     closest_hit_reason_pred),
-                '@%s ld.global.u32 %s, [%s + 52];' % (
+                '@%s ld.global.u32 %s, [%s + %u];' % (
                     continuation_reason_pred, hit_result_reg,
-                    continuation_lane_ptr_reg),
-                'setp.eq.u32 %s, %s, 2;' % (
-                    anyhit_accept_pred, hit_result_reg),
-                'setp.eq.u32 %s, %s, 3;' % (
-                    anyhit_ignore_pred, hit_result_reg),
+                    continuation_lane_ptr_reg,
+                    (rtcore_v04_field_spec(
+                        'commit_retained_candidate'
+                    )[0] * 4 if v04_continuation_lifecycle else 52)),
+                'setp.eq.u32 %s, %s, %u;' % (
+                    anyhit_accept_pred, hit_result_reg,
+                    1 if v04_continuation_lifecycle else 2),
+                *([
+                    'setp.eq.u32 %s, %s, 5;' % (
+                        anyhit_terminate_pred, hit_result_reg),
+                    'or.pred %s, %s, %s;' % (
+                        anyhit_accept_pred, anyhit_accept_pred,
+                        anyhit_terminate_pred),
+                ] if v04_continuation_lifecycle else []),
+                'setp.eq.u32 %s, %s, %u;' % (
+                    anyhit_ignore_pred, hit_result_reg,
+                    0 if v04_continuation_lifecycle else 3),
                 'or.pred %s, %s, %s;' % (
                     anyhit_valid_pred, anyhit_accept_pred,
                     anyhit_ignore_pred),
-                'setp.eq.u32 %s, %s, 1;' % (
-                    intersection_none_pred, hit_result_reg),
-                'setp.eq.u32 %s, %s, 4;' % (
-                    intersection_reported_pred, hit_result_reg),
+                'setp.eq.u32 %s, %s, %u;' % (
+                    intersection_none_pred, hit_result_reg,
+                    0 if v04_continuation_lifecycle else 1),
+                'setp.eq.u32 %s, %s, %u;' % (
+                    intersection_reported_pred, hit_result_reg,
+                    2 if v04_continuation_lifecycle else 4),
+                *([
+                    'setp.eq.u32 %s, %s, 6;' % (
+                        intersection_terminate_pred, hit_result_reg),
+                    'or.pred %s, %s, %s;' % (
+                        intersection_reported_pred,
+                        intersection_reported_pred,
+                        intersection_terminate_pred),
+                ] if v04_continuation_lifecycle else []),
                 'or.pred %s, %s, %s;' % (
                     intersection_valid_pred, intersection_none_pred,
                     intersection_reported_pred),
@@ -3485,6 +3544,9 @@ def translate_rt_shader_return_epilogue(ptx_shader):
     v04_shadow_return_publication = (
         rtcore_v04_shadow_shader_return_publication_enabled()
     )
+    v04_continuation_lifecycle = (
+        rtcore_v04_continuation_lifecycle_enabled()
+    )
     v04_builtin_consumer = rtcore_v04_shader_builtin_consumer_enabled()
     if not rtcore_symbolic_submit_enabled():
         return
@@ -3678,17 +3740,25 @@ def translate_rt_shader_return_epilogue(ptx_shader):
             ptx_shader.lines[index + 1:index + 1] = inserted
             index += len(inserted)
         elif functional_type == FunctionalType.exit:
-            epilogue = [
-                PTXLine.createNewLine(line.leadingWhiteSpace +
-                                      'st.global.u32 [%rt_handoff_lane_ptr + 56], '
-                                      '%rt_reported_t;\n'),
-                PTXLine.createNewLine(line.leadingWhiteSpace +
-                                      'st.global.u32 [%rt_handoff_lane_ptr + 60], '
-                                      '%rt_reported_metadata;\n'),
-                PTXLine.createNewLine(line.leadingWhiteSpace +
-                                      'st.global.u32 [%rt_handoff_lane_ptr + 52], '
-                                      '%rt_hit_result;\n'),
-            ]
+            epilogue = []
+            if not v04_continuation_lifecycle:
+                epilogue.extend([
+                    PTXLine.createNewLine(
+                        line.leadingWhiteSpace +
+                        'st.global.u32 [%rt_handoff_lane_ptr + 56], '
+                        '%rt_reported_t;\n'
+                    ),
+                    PTXLine.createNewLine(
+                        line.leadingWhiteSpace +
+                        'st.global.u32 [%rt_handoff_lane_ptr + 60], '
+                        '%rt_reported_metadata;\n'
+                    ),
+                    PTXLine.createNewLine(
+                        line.leadingWhiteSpace +
+                        'st.global.u32 [%rt_handoff_lane_ptr + 52], '
+                        '%rt_hit_result;\n'
+                    ),
+                ])
             if v04_shadow_return_publication:
                 if shader_type == ShaderType.Intersection:
                     has_report_test = PTXFunctionalLine()
@@ -3731,10 +3801,11 @@ def translate_rt_shader_return_epilogue(ptx_shader):
                             '%rt_handoff_lane_ptr', return_effect_offset
                         )
                     ),
-                    PTXLine.createNewLine(
-                        line.leadingWhiteSpace + 'membar.gl;\n'
-                    ),
                 ])
+                if not v04_continuation_lifecycle:
+                    epilogue.append(PTXLine.createNewLine(
+                        line.leadingWhiteSpace + 'membar.gl;\n'
+                    ))
             ptx_shader.lines[index:index] = epilogue
             index += len(epilogue)
         index += 1
