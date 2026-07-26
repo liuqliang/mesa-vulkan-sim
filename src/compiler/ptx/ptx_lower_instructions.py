@@ -1603,6 +1603,14 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         v04_continuation_lifecycle = (
             rtcore_v04_continuation_lifecycle_enabled()
         )
+        v04_return_publication = (
+            rtcore_v04_shadow_shader_return_publication_enabled()
+        )
+        v04_return_consumer = rtcore_v04_shader_builtin_consumer_enabled()
+        v04_traversal_effect_return = (
+            v04_continuation_lifecycle or
+            (v04_return_publication and v04_return_consumer)
+        )
         trace_submit_setup = []
 
         topLevelAS, rayFlags, cullMask, sbtRecordOffset, sbtRecordStride, missIndex, origin, Tmin, direction, Tmax, payload = line.args
@@ -2050,7 +2058,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 '%rt_publication_dirty_' + continuation_suffix,
                 '%rt_round_publication_dirty_' + continuation_suffix,
             ]
-            if v04_continuation_lifecycle:
+            if v04_traversal_effect_return:
                 continuation_predicates.extend([
                     '%rt_anyhit_terminate_' + continuation_suffix,
                     '%rt_anyhit_not_terminate_' + continuation_suffix,
@@ -2137,10 +2145,10 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                     continuation_lane_ptr_reg,
                     (rtcore_v04_field_spec(
                         'commit_retained_candidate'
-                    )[0] * 4 if v04_continuation_lifecycle else 52)),
+                    )[0] * 4 if v04_traversal_effect_return else 52)),
                 'setp.eq.u32 %s, %s, %u;' % (
                     anyhit_accept_pred, hit_result_reg,
-                    1 if v04_continuation_lifecycle else 2),
+                    1 if v04_traversal_effect_return else 2),
                 *([
                     'setp.eq.u32 %s, %s, 5;' % (
                         anyhit_terminate_pred, hit_result_reg),
@@ -2149,19 +2157,19 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                     'or.pred %s, %s, %s;' % (
                         anyhit_accept_pred, anyhit_accept_pred,
                         anyhit_terminate_pred),
-                ] if v04_continuation_lifecycle else []),
+                ] if v04_traversal_effect_return else []),
                 'setp.eq.u32 %s, %s, %u;' % (
                     anyhit_ignore_pred, hit_result_reg,
-                    0 if v04_continuation_lifecycle else 3),
+                    0 if v04_traversal_effect_return else 3),
                 'or.pred %s, %s, %s;' % (
                     anyhit_valid_pred, anyhit_accept_pred,
                     anyhit_ignore_pred),
                 'setp.eq.u32 %s, %s, %u;' % (
                     intersection_none_pred, hit_result_reg,
-                    0 if v04_continuation_lifecycle else 1),
+                    0 if v04_traversal_effect_return else 1),
                 'setp.eq.u32 %s, %s, %u;' % (
                     intersection_reported_pred, hit_result_reg,
-                    2 if v04_continuation_lifecycle else 4),
+                    2 if v04_traversal_effect_return else 4),
                 *([
                     'setp.eq.u32 %s, %s, 6;' % (
                         intersection_terminate_pred, hit_result_reg),
@@ -2171,7 +2179,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                         intersection_reported_pred,
                         intersection_reported_pred,
                         intersection_terminate_pred),
-                ] if v04_continuation_lifecycle else []),
+                ] if v04_traversal_effect_return else []),
                 'or.pred %s, %s, %s;' % (
                     intersection_valid_pred, intersection_none_pred,
                     intersection_reported_pred),
@@ -2182,7 +2190,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                     'and.pred %s, %s, %s;' % (
                         anyhit_resume_pred, anyhit_resume_pred,
                         anyhit_not_terminate_pred),
-                ] if v04_continuation_lifecycle else []),
+                ] if v04_traversal_effect_return else []),
                 'and.pred %s, %s, %s;' % (
                     intersection_resume_pred, intersection_reason_pred,
                     intersection_valid_pred),
@@ -2191,7 +2199,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                         intersection_resume_pred,
                         intersection_resume_pred,
                         intersection_not_terminate_pred),
-                ] if v04_continuation_lifecycle else []),
+                ] if v04_traversal_effect_return else []),
                 'or.pred %s, %s, %s;' % (
                     should_resubmit_pred, anyhit_resume_pred,
                     intersection_resume_pred),
@@ -3571,6 +3579,10 @@ def translate_rt_shader_return_epilogue(ptx_shader):
         rtcore_v04_continuation_lifecycle_enabled()
     )
     v04_builtin_consumer = rtcore_v04_shader_builtin_consumer_enabled()
+    v04_traversal_effect_return = (
+        v04_continuation_lifecycle or
+        (v04_shadow_return_publication and v04_builtin_consumer)
+    )
     if not rtcore_symbolic_submit_enabled():
         if any(
             getattr(line, 'functionalType', None)
@@ -3788,7 +3800,7 @@ def translate_rt_shader_return_epilogue(ptx_shader):
             index += len(inserted)
         elif functional_type == FunctionalType.exit:
             epilogue = []
-            if not v04_continuation_lifecycle:
+            if not v04_traversal_effect_return:
                 epilogue.extend([
                     PTXLine.createNewLine(
                         line.leadingWhiteSpace +
