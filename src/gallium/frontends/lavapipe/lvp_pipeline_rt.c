@@ -19,6 +19,35 @@ struct vsim_pipeline_stage {
 static bool gpgpusim_initialized = false;
 static int shader_ID = 0;
 
+static VkResult
+vsim_validate_ray_tracing_pipeline_capabilities(
+   struct lvp_device *device,
+   const VkRayTracingPipelineCreateInfoKHR *info)
+{
+   for (uint32_t i = 0; i < info->stageCount; i++) {
+      if (info->pStages[i].stage == VK_SHADER_STAGE_CALLABLE_BIT_KHR) {
+         fprintf(stderr,
+                 "LVP: callable shader execution is unsupported by "
+                 "Vulkan-Sim\n");
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+   }
+
+   for (uint32_t i = 0; i < info->groupCount; i++) {
+      const VkRayTracingShaderGroupCreateInfoKHR *group = &info->pGroups[i];
+      if (group->type ==
+             VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR &&
+          group->anyHitShader != VK_SHADER_UNUSED_KHR) {
+         fprintf(stderr,
+                 "LVP: procedural intersection plus any-hit is unsupported "
+                 "by Vulkan-Sim\n");
+         return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+      }
+   }
+
+   return VK_SUCCESS;
+}
+
 static void translate_nir_to_ptx(nir_shader *shader, char* shaderPath)
 {
    FILE *pFile;
@@ -181,6 +210,10 @@ lvp_ray_tracing_pipeline_create(
    VkResult result;
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR);
+   result = vsim_validate_ray_tracing_pipeline_capabilities(device,
+                                                            pCreateInfo);
+   if (result != VK_SUCCESS)
+      return result;
 
    // Create ray tracing pipeline
    struct lvp_pipeline *pipeline;

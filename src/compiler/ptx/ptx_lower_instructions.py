@@ -1577,6 +1577,23 @@ def translate_deref_instructions(ptx_shader):
         #             line.buildString('add%s' % variableType, (line.args[0], line.args[1], zero))
 
 def translate_trace_ray(ptx_shader, shaderIDs):
+    shader_type = ptx_shader.getShaderType()
+    has_trace_ray = any(
+        line.instructionClass == InstructionClass.Functional and
+        line.functionalType == FunctionalType.trace_ray
+        for line in ptx_shader.lines
+    )
+    if (
+            has_trace_ray and
+            shader_type != ShaderType.Ray_generation and
+            rtcore_symbolic_submit_enabled()):
+        rtcore_raise_compiler_lowering_contract_violation(
+            'nested trace_ray is unsupported by the custom RT path in %s '
+            'shader; use VULKAN_SIM_RTCORE_PATH_MODE=legacy to preserve the '
+            'original Vulkan-Sim lowering' %
+            shader_type.name
+        )
+
     trace_ray_ID = 0
     skip_lines = -1
     for index in range(len(ptx_shader.lines)):
@@ -2274,9 +2291,6 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         #intersection shaders
         intersection_lines = []
         anyhit_lines = []
-
-        if ShaderType.Intersection in shaderIDs and ShaderType.Any_hit in shaderIDs:
-            print("Combined intersection and anyhit shader currently unimplemented! Results may be incorrect!")
 
         if ShaderType.Intersection in shaderIDs:
 
