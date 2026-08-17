@@ -140,10 +140,17 @@ RTCORE_CONTINUATION_STACK_DEFAULT_BYTES = 4096
 RTCORE_CONTINUATION_FRAME_HEADER_BYTES = 32
 RTCORE_CONTINUATION_FRAME_MAGIC = 0x52544346
 RTCORE_CONTINUATION_FRAME_KIND_TRACE = 1
+RTCORE_CONTINUATION_FRAME_KIND_CALLABLE = 2
 RTCORE_KHR_TRACE_SLOT_LAYOUT = {
     ShaderType.Ray_generation: (0, 4),
     ShaderType.Closest_hit: (4, 2),
     ShaderType.Miss: (6, 2),
+}
+RTCORE_KHR_CALLABLE_SITE_LAYOUT = {
+    ShaderType.Ray_generation: (64, 8),
+    ShaderType.Closest_hit: (72, 8),
+    ShaderType.Miss: (80, 8),
+    ShaderType.Callable: (88, 8),
 }
 RTCORE_KHR_OPERATION_STAGE_RULES = {
     FunctionalType.trace_ray: (
@@ -371,12 +378,33 @@ def rtcore_khr_operation_implementation_status(functional_type, shader_type):
                 ShaderType.Miss,
             )):
         return 'enabled'
+    if (functional_type == FunctionalType.execute_callable and
+            rtcore_megakernel_continuation_stack_enabled()):
+        return 'enabled'
     if functional_type in (
             FunctionalType.report_ray_intersection,
             FunctionalType.ignore_ray_intersection,
             FunctionalType.terminate_ray):
         return 'enabled'
     return 'legal_but_not_enabled'
+
+
+def rtcore_khr_callable_site(shader_type, local_callable_site):
+    layout = RTCORE_KHR_CALLABLE_SITE_LAYOUT.get(shader_type)
+    if layout is None:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'strict Vulkan KHR ExecuteCallable has no site domain for %s' %
+            shader_type.name
+        )
+    base, capacity = layout
+    if local_callable_site >= capacity:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'strict Vulkan KHR %s shader has %u ExecuteCallable sites; the '
+            'bounded resident candidate supports %u' % (
+                shader_type.name, local_callable_site + 1, capacity
+            )
+        )
+    return base + local_callable_site
 
 
 def rtcore_khr_trace_slot(shader_type, local_trace_site):
@@ -1301,6 +1329,7 @@ def rtcore_prepare_continuation_ptx_profile(ptx_shader):
             ShaderType.Ray_generation,
             ShaderType.Closest_hit,
             ShaderType.Miss,
+            ShaderType.Callable,
         )
     if ptx_shader.getShaderType() not in continuation_stages:
         return
@@ -2917,6 +2946,56 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         skip_lines = index + len(newLines) - 1
 
         trace_ray_ID += 1
+
+
+def translate_execute_callable(ptx_shader):
+    callable_site = 0
+    index = 0
+    while index < len(ptx_shader.lines):
+        line = ptx_shader.lines[index]
+        if (line.instructionClass != InstructionClass.Functional or
+                line.functionalType != FunctionalType.execute_callable):
+            index += 1
+            continue
+        if not rtcore_megakernel_continuation_stack_enabled():
+            rtcore_raise_compiler_lowering_contract_violation(
+                'ExecuteCallable requires the resident continuation candidate'
+            )
+        if line.condition:
+            rtcore_raise_compiler_lowering_contract_violation(
+                'predicated ExecuteCallable sites are unsupported'
+            )
+        if len(line.args) != 2:
+            rtcore_raise_compiler_lowering_contract_violation(
+                'ExecuteCallable requires SBT index and callable-data pointer'
+            )
+
+        site = rtcore_khr_callable_site(
+            ptx_shader.getShaderType(), callable_site
+        )
+        line.buildString('rt_execute_callable', tuple(line.args))
+        # PTXFunctionalLine.buildString deliberately preserves an already
+        # parsed fullFunction.  This is a semantic opcode replacement, so keep
+        # the analysis view in sync with the emitted command.
+        line.fullFunction = 'rt_execute_callable'
+        line.functionalType = FunctionalType.Other
+        begin_marker = PTXLine('')
+        begin_marker.fullLine = (
+            line.leadingWhiteSpace +
+            '// rtcore_megakernel_continuation_begin '
+            'kind=callable site=%u\n' % site
+        )
+        end_marker = PTXLine('')
+        end_marker.fullLine = (
+            line.leadingWhiteSpace +
+            '// rtcore_megakernel_continuation_end '
+            'kind=callable site=%u\n' % site
+        )
+        ptx_shader.lines[index:index + 1] = [
+            begin_marker, line, end_marker
+        ]
+        callable_site += 1
+        index += 3
 
 
 
@@ -4615,7 +4694,7 @@ RTCORE_CONTINUATION_PURE_REMAT_OPS = frozenset((
 ))
 RTCORE_CONTINUATION_NO_DEST_OPS = frozenset((
     'st', 'bra', 'ret', 'exit', 'membar', 'bar', 'call',
-    'rt_retire_context', 'end_trace_ray',
+    'rt_retire_context', 'rt_execute_callable', 'end_trace_ray',
 ))
 
 
@@ -4786,14 +4865,17 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
     if ptx_shader.getShaderType() not in (
             ShaderType.Ray_generation,
             ShaderType.Closest_hit,
-            ShaderType.Miss):
+            ShaderType.Miss,
+            ShaderType.Callable):
         return []
 
     begin_pattern = re.compile(
-        r'rtcore_megakernel_continuation_begin site=(\d+)'
+        r'rtcore_megakernel_continuation_begin '
+        r'(?:(?:kind=(trace|callable) )?site=(\d+))'
     )
     end_pattern = re.compile(
-        r'rtcore_megakernel_continuation_end site=(\d+)'
+        r'rtcore_megakernel_continuation_end '
+        r'(?:(?:kind=(trace|callable) )?site=(\d+))'
     )
     open_sites = {}
     regions = []
@@ -4801,19 +4883,26 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
         begin = begin_pattern.search(line.fullLine)
         end = end_pattern.search(line.fullLine)
         if begin:
-            site = int(begin.group(1))
+            kind = begin.group(1) or 'trace'
+            site = int(begin.group(2))
             if site in open_sites:
                 rtcore_raise_compiler_lowering_contract_violation(
                     'duplicate continuation begin marker for site %u' % site
                 )
-            open_sites[site] = index
+            open_sites[site] = (kind, index)
         if end:
-            site = int(end.group(1))
+            kind = end.group(1) or 'trace'
+            site = int(end.group(2))
             if site not in open_sites:
                 rtcore_raise_compiler_lowering_contract_violation(
                     'continuation end without begin for site %u' % site
                 )
-            regions.append((site, open_sites.pop(site), index))
+            begin_kind, begin_index = open_sites.pop(site)
+            if begin_kind != kind:
+                rtcore_raise_compiler_lowering_contract_violation(
+                    'continuation kind mismatch for site %u' % site
+                )
+            regions.append((site, kind, begin_index, index))
     if open_sites:
         rtcore_raise_compiler_lowering_contract_violation(
             'unterminated resident continuation region'
@@ -4821,9 +4910,9 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
     if not regions:
         return []
     stack_capacity_bytes = rtcore_continuation_stack_capacity_bytes()
-    regions.sort(key=lambda region: region[1])
+    regions.sort(key=lambda region: region[2])
     for previous, current in zip(regions, regions[1:]):
-        if previous[2] >= current[1]:
+        if previous[3] >= current[2]:
             rtcore_raise_compiler_lowering_contract_violation(
                 'overlapping resident continuation regions'
             )
@@ -4838,31 +4927,48 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             definition_indices.setdefault(register, []).append(index)
 
     plans = []
-    for site, begin_index, end_index in regions:
-        submit_indices = [
-            index for index in range(begin_index + 1, end_index)
-            if rtcore_continuation_opcode(ptx_shader.lines[index]) == 'rt_submit'
-        ]
-        retire_indices = [
-            index for index in range(begin_index + 1, end_index)
-            if rtcore_continuation_opcode(ptx_shader.lines[index]) ==
-            'rt_retire_context'
-        ]
-        if not submit_indices or len(retire_indices) != 1:
-            rtcore_raise_compiler_lowering_contract_violation(
-                'site %u requires at least one submit and exactly one retire' %
-                site
-            )
-        first_submit = submit_indices[0]
-        retire_index = retire_indices[0]
-        if first_submit >= retire_index:
-            rtcore_raise_compiler_lowering_contract_violation(
-                'site %u has invalid submit/retire ordering' % site
-            )
+    for site, kind, begin_index, end_index in regions:
+        if kind == 'trace':
+            submit_indices = [
+                index for index in range(begin_index + 1, end_index)
+                if rtcore_continuation_opcode(ptx_shader.lines[index]) ==
+                'rt_submit'
+            ]
+            resume_indices = [
+                index for index in range(begin_index + 1, end_index)
+                if rtcore_continuation_opcode(ptx_shader.lines[index]) ==
+                'rt_retire_context'
+            ]
+            if not submit_indices or len(resume_indices) != 1:
+                rtcore_raise_compiler_lowering_contract_violation(
+                    'trace site %u requires at least one submit and exactly '
+                    'one retire' % site
+                )
+            first_submit = submit_indices[0]
+            resume_index = resume_indices[0]
+            if first_submit >= resume_index:
+                rtcore_raise_compiler_lowering_contract_violation(
+                    'trace site %u has invalid submit/retire ordering' % site
+                )
+            frame_kind = RTCORE_CONTINUATION_FRAME_KIND_TRACE
+        else:
+            call_indices = [
+                index for index in range(begin_index + 1, end_index)
+                if rtcore_continuation_opcode(ptx_shader.lines[index]) ==
+                'rt_execute_callable'
+            ]
+            if len(call_indices) != 1:
+                rtcore_raise_compiler_lowering_contract_violation(
+                    'callable site %u requires exactly one call boundary' %
+                    site
+                )
+            first_submit = call_indices[0]
+            resume_index = call_indices[0]
+            frame_kind = RTCORE_CONTINUATION_FRAME_KIND_CALLABLE
 
         post_live = set()
         post_uses_union = set()
-        for index in range(len(ptx_shader.lines) - 1, retire_index, -1):
+        for index in range(len(ptx_shader.lines) - 1, resume_index, -1):
             definitions, uses = def_use_by_index[index]
             post_uses_union.update(uses)
             # A predicated definition does not kill the incoming value on
@@ -4881,7 +4987,7 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             if not register.startswith('%ssa_')
         )
         region_definitions = set()
-        for definitions, _ in def_use_by_index[first_submit:retire_index + 1]:
+        for definitions, _ in def_use_by_index[first_submit:resume_index + 1]:
             region_definitions.update(definitions)
 
         reaching_defs = {}
@@ -4891,7 +4997,7 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             before = [index for index in indices if index < first_submit]
             inside = [
                 index for index in indices
-                if first_submit <= index <= retire_index
+                if first_submit <= index <= resume_index
             ]
             if not before or inside or register not in declarations:
                 continue
@@ -4976,8 +5082,8 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             rtcore_continuation_make_line(
                 '.reg .pred %s;' % invalid_header, whitespace),
             rtcore_continuation_marker(
-                'rtcore_continuation_push site=%u kind=trace '
-                'frame_bytes=%u' % (site, stack_frame_bytes), whitespace),
+                'rtcore_continuation_push site=%u kind=%s '
+                'frame_bytes=%u' % (site, kind, stack_frame_bytes), whitespace),
             rtcore_continuation_make_line(
                 'add.u32 %s, %%rt_continuation_sp, %u;' %
                 (next_sp, stack_frame_bytes), whitespace),
@@ -5000,7 +5106,7 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
                 (frame_base, RTCORE_CONTINUATION_FRAME_MAGIC), whitespace),
             rtcore_continuation_make_line(
                 'st.local.u32 [%s+4], %u;' %
-                (frame_base, RTCORE_CONTINUATION_FRAME_KIND_TRACE), whitespace),
+                (frame_base, frame_kind), whitespace),
             rtcore_continuation_make_line(
                 'st.local.u32 [%s+8], %u;' % (frame_base, site), whitespace),
             rtcore_continuation_make_line(
@@ -5088,7 +5194,7 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
         ]
         for offset, expected in (
                 (0, RTCORE_CONTINUATION_FRAME_MAGIC),
-                (4, RTCORE_CONTINUATION_FRAME_KIND_TRACE),
+                (4, frame_kind),
                 (8, site),
                 (12, stack_frame_bytes),
                 (16, None),
@@ -5127,16 +5233,17 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
                 whitespace,
             ),
             rtcore_continuation_marker(
-                'rtcore_continuation_pop site=%u kind=trace '
-                'frame_bytes=%u' % (site, stack_frame_bytes), whitespace),
+                'rtcore_continuation_pop site=%u kind=%s '
+                'frame_bytes=%u' % (site, kind, stack_frame_bytes), whitespace),
         ])
 
         # Registers with no post-region use naturally end before the trace
         # boundary; no runtime kill instruction is required.
         plans.append({
             'site': site,
+            'kind': kind,
             'first_submit': first_submit,
-            'retire_index': retire_index,
+            'resume_index': resume_index,
             'before_submit': before_submit,
             'after_retire': after_retire,
             'cross_live': sorted(cross_live),
@@ -5185,7 +5292,7 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
     plans[0]['before_submit'][0:0] = common_prologue
 
     for plan in reversed(plans):
-        ptx_shader.lines[plan['retire_index'] + 1:plan['retire_index'] + 1] = (
+        ptx_shader.lines[plan['resume_index'] + 1:plan['resume_index'] + 1] = (
             plan['after_retire']
         )
         ptx_shader.lines[plan['first_submit']:plan['first_submit']] = (
@@ -5228,6 +5335,7 @@ def main():
         translate_descriptor_set_instructions(shader)
         translate_deref_instructions(shader)
         translate_trace_ray(shader, shaderIDs)
+        translate_execute_callable(shader)
         translate_decl_var(shader)
         translate_rt_shader_builtin_consumers(shader)
         translate_load_GL_instructions(shader)

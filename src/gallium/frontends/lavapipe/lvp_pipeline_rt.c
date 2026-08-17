@@ -40,10 +40,11 @@ vsim_validate_ray_tracing_pipeline_capabilities(
    }
 
    for (uint32_t i = 0; i < info->stageCount; i++) {
-      if (info->pStages[i].stage == VK_SHADER_STAGE_CALLABLE_BIT_KHR) {
+      if (info->pStages[i].stage == VK_SHADER_STAGE_CALLABLE_BIT_KHR &&
+          (!continuation_candidate || strcmp(continuation_candidate, "1"))) {
          fprintf(stderr,
-                 "LVP: callable shader execution is unsupported by "
-                 "Vulkan-Sim\n");
+                 "LVP: callable shader execution requires the default-off "
+                 "resident continuation candidate\n");
          return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
       }
    }
