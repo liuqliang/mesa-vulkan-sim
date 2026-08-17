@@ -141,6 +141,7 @@ RTCORE_CONTINUATION_FRAME_HEADER_BYTES = 32
 RTCORE_CONTINUATION_FRAME_MAGIC = 0x52544346
 RTCORE_CONTINUATION_FRAME_KIND_TRACE = 1
 RTCORE_CONTINUATION_FRAME_KIND_CALLABLE = 2
+RTCORE_CONTINUATION_FRAME_KIND_REPORT_INTERSECTION = 3
 RTCORE_KHR_TRACE_SLOT_LAYOUT = {
     ShaderType.Ray_generation: (0, 4),
     ShaderType.Closest_hit: (4, 2),
@@ -151,6 +152,9 @@ RTCORE_KHR_CALLABLE_SITE_LAYOUT = {
     ShaderType.Closest_hit: (72, 8),
     ShaderType.Miss: (80, 8),
     ShaderType.Callable: (88, 8),
+}
+RTCORE_KHR_REPORT_SITE_LAYOUT = {
+    ShaderType.Intersection: (96, 16),
 }
 RTCORE_KHR_OPERATION_STAGE_RULES = {
     FunctionalType.trace_ray: (
@@ -405,6 +409,24 @@ def rtcore_khr_callable_site(shader_type, local_callable_site):
             )
         )
     return base + local_callable_site
+
+
+def rtcore_khr_report_site(shader_type, local_report_site):
+    layout = RTCORE_KHR_REPORT_SITE_LAYOUT.get(shader_type)
+    if layout is None:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'strict Vulkan KHR ReportIntersection has no site domain for %s' %
+            shader_type.name
+        )
+    base, capacity = layout
+    if local_report_site >= capacity:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'strict Vulkan KHR %s shader has %u ReportIntersection sites; '
+            'the bounded resident candidate supports %u' % (
+                shader_type.name, local_report_site + 1, capacity
+            )
+        )
+    return base + local_report_site
 
 
 def rtcore_khr_trace_slot(shader_type, local_trace_site):
@@ -2998,6 +3020,44 @@ def translate_execute_callable(ptx_shader):
         index += 3
 
 
+def translate_report_intersection_continuations(ptx_shader):
+    if not rtcore_megakernel_continuation_stack_enabled():
+        return
+    report_site = 0
+    index = 0
+    while index < len(ptx_shader.lines):
+        line = ptx_shader.lines[index]
+        if (line.instructionClass != InstructionClass.Functional or
+                line.functionalType !=
+                FunctionalType.report_ray_intersection):
+            index += 1
+            continue
+        if line.condition:
+            rtcore_raise_compiler_lowering_contract_violation(
+                'predicated ReportIntersection sites are unsupported'
+            )
+        site = rtcore_khr_report_site(
+            ptx_shader.getShaderType(), report_site
+        )
+        begin_marker = PTXLine('')
+        begin_marker.fullLine = (
+            line.leadingWhiteSpace +
+            '// rtcore_megakernel_continuation_begin '
+            'kind=report site=%u\n' % site
+        )
+        end_marker = PTXLine('')
+        end_marker.fullLine = (
+            line.leadingWhiteSpace +
+            '// rtcore_megakernel_continuation_end '
+            'kind=report site=%u\n' % site
+        )
+        ptx_shader.lines[index:index + 1] = [
+            begin_marker, line, end_marker
+        ]
+        report_site += 1
+        index += 3
+
+
 
 def translate_decl_var(ptx_shader):
     new_declerations = []
@@ -3971,7 +4031,14 @@ def translate_rt_shader_return_epilogue(ptx_shader):
             PTXLine.createNewLine(
                 leading + '.reg .u32 %rt_reported_metadata;\n'
             ),
+            PTXLine.createNewLine(
+                leading + '.reg .pred %rt_report_terminated;\n'
+            ),
         ])
+        if shader_type == ShaderType.Any_hit:
+            prologue.append(PTXLine.createNewLine(
+                leading + '.reg .pred %rt_report_active;\n'
+            ))
     if v04_shadow_return_publication and returns_to_rtcore:
         prologue.append(
             PTXLine.createNewLine(
@@ -4036,20 +4103,23 @@ def translate_rt_shader_return_epilogue(ptx_shader):
             ptx_shader.lines[index + 1:index + 1] = inserted
             index += len(inserted)
         elif functional_type == FunctionalType.terminate_ray:
-            replacement = [
+            line.buildString('rt_terminate_ray', ())
+            line.fullFunction = 'rt_terminate_ray'
+            line.functionalType = FunctionalType.Other
+            inserted = [
                 PTXLine.createNewLine(
                     line.leadingWhiteSpace +
                     'mov.u32 %rt_hit_result, 5;\n'
                 )
             ]
             if v04_shadow_return_publication:
-                replacement.append(PTXLine.createNewLine(
+                inserted.append(PTXLine.createNewLine(
                     line.leadingWhiteSpace +
                     'mov.u32 %%rt_v04_return_effect, %u;\n' %
                     (commit_effect_value | terminate_effect_value)
                 ))
-            ptx_shader.lines[index:index + 1] = replacement
-            index += len(replacement) - 1
+            ptx_shader.lines[index + 1:index + 1] = inserted
+            index += len(inserted)
         elif functional_type == FunctionalType.report_ray_intersection:
             reported_predicate, reported_t, reported_hit_kind = line.args[:3]
             hit_result_move = PTXFunctionalLine()
@@ -4073,6 +4143,14 @@ def translate_rt_shader_return_epilogue(ptx_shader):
                 metadata_move,
             ]
             if v04_shadow_return_publication:
+                report_terminate_query = PTXFunctionalLine()
+                report_terminate_query.leadingWhiteSpace = (
+                    line.leadingWhiteSpace
+                )
+                report_terminate_query.buildString(
+                    'rt_report_terminate.pred',
+                    ('%rt_report_terminated',),
+                )
                 v04_effect_move = PTXFunctionalLine()
                 v04_effect_move.leadingWhiteSpace = line.leadingWhiteSpace
                 v04_effect_move.condition = '@' + reported_predicate
@@ -4088,7 +4166,26 @@ def translate_rt_shader_return_epilogue(ptx_shader):
                     'mov.u32',
                     ('%rt_v04_reported_metadata', reported_hit_kind),
                 )
-                inserted.extend([v04_effect_move, v04_metadata_move])
+                v04_terminate_effect_move = PTXFunctionalLine()
+                v04_terminate_effect_move.leadingWhiteSpace = (
+                    line.leadingWhiteSpace
+                )
+                v04_terminate_effect_move.condition = (
+                    '@%rt_report_terminated'
+                )
+                v04_terminate_effect_move.buildString(
+                    'mov.u32', (
+                        '%rt_v04_return_effect',
+                        str(accepted_report_effect_value |
+                            terminate_effect_value),
+                    )
+                )
+                inserted.extend([
+                    report_terminate_query,
+                    v04_effect_move,
+                    v04_terminate_effect_move,
+                    v04_metadata_move,
+                ])
             ptx_shader.lines[index + 1:index + 1] = inserted
             index += len(inserted)
         elif functional_type == FunctionalType.exit:
@@ -4112,6 +4209,31 @@ def translate_rt_shader_return_epilogue(ptx_shader):
                     ),
                 ])
             if v04_shadow_return_publication:
+                if shader_type == ShaderType.Any_hit:
+                    report_active_query = PTXFunctionalLine()
+                    report_active_query.leadingWhiteSpace = (
+                        line.leadingWhiteSpace
+                    )
+                    report_active_query.buildString(
+                        'rt_report_active.pred',
+                        ('%rt_report_active',),
+                    )
+                    report_publication_skip_label = (
+                        'rt_report_publication_skip_' + str(index)
+                    )
+                    report_publication_skip = PTXFunctionalLine()
+                    report_publication_skip.leadingWhiteSpace = (
+                        line.leadingWhiteSpace
+                    )
+                    report_publication_skip.condition = '@%rt_report_active'
+                    report_publication_skip.buildString(
+                        FunctionalType.bra,
+                        (report_publication_skip_label,),
+                    )
+                    epilogue.extend([
+                        report_active_query,
+                        report_publication_skip,
+                    ])
                 if shader_type == ShaderType.Intersection:
                     has_report_test = PTXFunctionalLine()
                     has_report_test.leadingWhiteSpace = line.leadingWhiteSpace
@@ -4145,18 +4267,30 @@ def translate_rt_shader_return_epilogue(ptx_shader):
                         reported_t_store,
                         reported_metadata_store,
                     ])
+                return_effect_store = PTXFunctionalLine()
+                return_effect_store.leadingWhiteSpace = line.leadingWhiteSpace
+                return_effect_store.condition = ''
+                return_effect_store.buildString(
+                    'st.global.u32',
+                    (rtcore_v04_handoff_word_address(
+                        '%rt_handoff_lane_ptr', return_effect_offset
+                     ), '%rt_v04_return_effect'),
+                )
+                return_effect_barrier = PTXFunctionalLine()
+                return_effect_barrier.leadingWhiteSpace = line.leadingWhiteSpace
+                return_effect_barrier.condition = ''
+                return_effect_barrier.buildString('membar.gl', ())
                 epilogue.extend([
-                    PTXLine.createNewLine(
-                        line.leadingWhiteSpace +
-                        'st.global.u32 %s, %%rt_v04_return_effect;\n' %
-                        rtcore_v04_handoff_word_address(
-                            '%rt_handoff_lane_ptr', return_effect_offset
-                        )
-                    ),
+                    return_effect_store,
+                    return_effect_barrier,
                 ])
-                epilogue.append(PTXLine.createNewLine(
-                    line.leadingWhiteSpace + 'membar.gl;\n'
-                ))
+                if shader_type == ShaderType.Any_hit:
+                    report_publication_skip_target = PTXLine('')
+                    report_publication_skip_target.fullLine = (
+                        line.leadingWhiteSpace +
+                        report_publication_skip_label + ':\n'
+                    )
+                    epilogue.append(report_publication_skip_target)
             ptx_shader.lines[index:index] = epilogue
             index += len(epilogue)
         index += 1
@@ -4866,16 +5000,17 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             ShaderType.Ray_generation,
             ShaderType.Closest_hit,
             ShaderType.Miss,
-            ShaderType.Callable):
+            ShaderType.Callable,
+            ShaderType.Intersection):
         return []
 
     begin_pattern = re.compile(
         r'rtcore_megakernel_continuation_begin '
-        r'(?:(?:kind=(trace|callable) )?site=(\d+))'
+        r'(?:(?:kind=(trace|callable|report) )?site=(\d+))'
     )
     end_pattern = re.compile(
         r'rtcore_megakernel_continuation_end '
-        r'(?:(?:kind=(trace|callable) )?site=(\d+))'
+        r'(?:(?:kind=(trace|callable|report) )?site=(\d+))'
     )
     open_sites = {}
     regions = []
@@ -4951,7 +5086,7 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
                     'trace site %u has invalid submit/retire ordering' % site
                 )
             frame_kind = RTCORE_CONTINUATION_FRAME_KIND_TRACE
-        else:
+        elif kind == 'callable':
             call_indices = [
                 index for index in range(begin_index + 1, end_index)
                 if rtcore_continuation_opcode(ptx_shader.lines[index]) ==
@@ -4965,6 +5100,20 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             first_submit = call_indices[0]
             resume_index = call_indices[0]
             frame_kind = RTCORE_CONTINUATION_FRAME_KIND_CALLABLE
+        else:
+            report_indices = [
+                index for index in range(begin_index + 1, end_index)
+                if rtcore_continuation_opcode(ptx_shader.lines[index]) ==
+                'report_ray_intersection'
+            ]
+            if len(report_indices) != 1:
+                rtcore_raise_compiler_lowering_contract_violation(
+                    'report site %u requires exactly one synchronous '
+                    'ReportIntersection boundary' % site
+                )
+            first_submit = report_indices[0]
+            resume_index = report_indices[0]
+            frame_kind = RTCORE_CONTINUATION_FRAME_KIND_REPORT_INTERSECTION
 
         post_live = set()
         post_uses_union = set()
@@ -5336,6 +5485,7 @@ def main():
         translate_deref_instructions(shader)
         translate_trace_ray(shader, shaderIDs)
         translate_execute_callable(shader)
+        translate_report_intersection_continuations(shader)
         translate_decl_var(shader)
         translate_rt_shader_builtin_consumers(shader)
         translate_load_GL_instructions(shader)

@@ -53,10 +53,11 @@ vsim_validate_ray_tracing_pipeline_capabilities(
       const VkRayTracingShaderGroupCreateInfoKHR *group = &info->pGroups[i];
       if (group->type ==
              VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR &&
-          group->anyHitShader != VK_SHADER_UNUSED_KHR) {
+          group->anyHitShader != VK_SHADER_UNUSED_KHR &&
+          (!continuation_candidate || strcmp(continuation_candidate, "1"))) {
          fprintf(stderr,
                  "LVP: procedural intersection plus any-hit is unsupported "
-                 "by Vulkan-Sim\n");
+                 "without the resident continuation candidate\n");
          return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
       }
    }
@@ -235,19 +236,23 @@ lvp_ray_tracing_pipeline_create(
    struct lvp_pipeline *pipeline;
    pipeline = vk_zalloc(&device->vk.alloc, sizeof(*pipeline), 8,
                          VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (pipeline == NULL)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
    pipeline->group_count = pCreateInfo->groupCount;
    pipeline->group_handles = vk_zalloc(&device->vk.alloc, 
          sizeof(*pipeline->group_handles) * pipeline->group_count,
          8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (pipeline->group_handles == NULL) {
+      vk_free(&device->vk.alloc, pipeline);
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
    for (uint32_t i = 0; i < pipeline->group_count; i++) {
       pipeline->group_handles[i].general_index = VK_SHADER_UNUSED_KHR;
       pipeline->group_handles[i].intersection_index = VK_SHADER_UNUSED_KHR;
+      pipeline->group_handles[i].any_hit_index = VK_SHADER_UNUSED_KHR;
    }
    
    
-   if (pipeline == NULL)
-      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-
    vk_object_base_init(&device->vk, &pipeline->base,
                        VK_OBJECT_TYPE_PIPELINE);
 
@@ -285,6 +290,10 @@ lvp_ray_tracing_pipeline_create(
          if (group_info->intersectionShader != VK_SHADER_UNUSED_KHR) {
             pipeline->group_handles[i].intersection_index = group_info->intersectionShader;
             printf("\tintersection_index %d\n", group_info->intersectionShader);
+         }
+         if (group_info->anyHitShader != VK_SHADER_UNUSED_KHR) {
+            pipeline->group_handles[i].any_hit_index = group_info->anyHitShader;
+            printf("\tany_hit_index %d\n", group_info->anyHitShader);
          }
          break;
       case VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR:

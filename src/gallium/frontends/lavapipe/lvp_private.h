@@ -469,10 +469,8 @@ struct lvp_pipeline_group_handle {
       uint32_t general_index;
       uint32_t closest_hit_index;
    };
-   union {
-      uint32_t intersection_index;
-      uint32_t any_hit_index;
-   };
+   uint32_t intersection_index;
+   uint32_t any_hit_index;
 };
 
 struct lvp_inline_variant {
