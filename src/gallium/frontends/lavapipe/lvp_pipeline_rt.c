@@ -6,6 +6,9 @@
 
 #include "gpgpusim_calls_from_mesa.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 struct vsim_pipeline_stage {
    gl_shader_stage stage;
    const VkPipelineShaderStageCreateInfo *info;
@@ -24,6 +27,18 @@ vsim_validate_ray_tracing_pipeline_capabilities(
    struct lvp_device *device,
    const VkRayTracingPipelineCreateInfoKHR *info)
 {
+   const char *continuation_candidate =
+      getenv("VULKAN_SIM_RTCORE_MEGAKERNEL_CONTINUATION_STACK");
+   if (continuation_candidate && !strcmp(continuation_candidate, "1") &&
+       (info->maxPipelineRayRecursionDepth == 0 ||
+        info->maxPipelineRayRecursionDepth > 8)) {
+      fprintf(stderr,
+              "LVP: resident continuation pipeline recursion depth %u is "
+              "outside the supported range [1, 8]\n",
+              info->maxPipelineRayRecursionDepth);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
+
    for (uint32_t i = 0; i < info->stageCount; i++) {
       if (info->pStages[i].stage == VK_SHADER_STAGE_CALLABLE_BIT_KHR) {
          fprintf(stderr,

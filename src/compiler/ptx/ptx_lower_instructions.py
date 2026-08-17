@@ -140,6 +140,11 @@ RTCORE_CONTINUATION_STACK_DEFAULT_BYTES = 4096
 RTCORE_CONTINUATION_FRAME_HEADER_BYTES = 32
 RTCORE_CONTINUATION_FRAME_MAGIC = 0x52544346
 RTCORE_CONTINUATION_FRAME_KIND_TRACE = 1
+RTCORE_KHR_TRACE_SLOT_LAYOUT = {
+    ShaderType.Ray_generation: (0, 4),
+    ShaderType.Closest_hit: (4, 2),
+    ShaderType.Miss: (6, 2),
+}
 RTCORE_KHR_OPERATION_STAGE_RULES = {
     FunctionalType.trace_ray: (
         ShaderType.Ray_generation,
@@ -360,7 +365,11 @@ def rtcore_continuation_stack_capacity_bytes():
 
 def rtcore_khr_operation_implementation_status(functional_type, shader_type):
     if (functional_type == FunctionalType.trace_ray and
-            shader_type == ShaderType.Ray_generation):
+            shader_type in (
+                ShaderType.Ray_generation,
+                ShaderType.Closest_hit,
+                ShaderType.Miss,
+            )):
         return 'enabled'
     if functional_type in (
             FunctionalType.report_ray_intersection,
@@ -368,6 +377,29 @@ def rtcore_khr_operation_implementation_status(functional_type, shader_type):
             FunctionalType.terminate_ray):
         return 'enabled'
     return 'legal_but_not_enabled'
+
+
+def rtcore_khr_trace_slot(shader_type, local_trace_site):
+    layout = RTCORE_KHR_TRACE_SLOT_LAYOUT.get(shader_type)
+    if layout is None:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'strict Vulkan KHR recursive TraceRay has no slot domain for %s' %
+            shader_type.name
+        )
+    base, capacity = layout
+    if local_trace_site >= capacity:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'strict Vulkan KHR %s shader has %u TraceRay sites; the bounded '
+            'resident candidate supports %u' % (
+                shader_type.name, local_trace_site + 1, capacity
+            )
+        )
+    slot = base + local_trace_site
+    if slot >= RTCORE_MAX_TRACE_SITES:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'strict Vulkan KHR TraceRay slot exceeds the compact arena'
+        )
+    return slot
 
 
 def rtcore_validate_khr_shader_operations(
@@ -1261,8 +1293,16 @@ def rtcore_raise_compiler_lowering_contract_violation(reason):
 
 
 def rtcore_prepare_continuation_ptx_profile(ptx_shader):
-    if (not rtcore_symbolic_submit_enabled() or
-            ptx_shader.getShaderType() != ShaderType.Ray_generation):
+    if not rtcore_symbolic_submit_enabled():
+        return
+    continuation_stages = (ShaderType.Ray_generation,)
+    if rtcore_megakernel_continuation_stack_enabled():
+        continuation_stages = (
+            ShaderType.Ray_generation,
+            ShaderType.Closest_hit,
+            ShaderType.Miss,
+        )
+    if ptx_shader.getShaderType() not in continuation_stages:
         return
 
     version_index = None
@@ -1794,10 +1834,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         trace_ray_lines = [line]
         continuation_anchor_lines = []
         if symbolic_rt_submit:
-            if trace_ray_ID >= RTCORE_MAX_TRACE_SITES:
-                rtcore_raise_compiler_lowering_contract_violation(
-                    'trace-ray site exceeds bounded compact context arenas'
-                )
+            trace_slot = rtcore_khr_trace_slot(shader_type, trace_ray_ID)
             context_ptr_reg = '%rt_context_ptr_' + str(trace_ray_ID)
             context_base_reg = '%rt_context_base_' + str(trace_ray_ID)
             context_lane_offset_reg = '%rt_context_lane_offset_' + str(trace_ray_ID)
@@ -1906,7 +1943,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             context_base_init = PTXFunctionalLine()
             context_base_init.leadingWhiteSpace = line.leadingWhiteSpace
-            context_base_init.buildString('mov.b64', (context_base_reg, rtcore_dispatch_descriptor_v0_context_base(trace_ray_ID)))
+            context_base_init.buildString('mov.b64', (context_base_reg, rtcore_dispatch_descriptor_v0_context_base(trace_slot)))
 
             launch_id_init = PTXFunctionalLine()
             launch_id_init.leadingWhiteSpace = line.leadingWhiteSpace
@@ -1936,7 +1973,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             handoff_window_base_init = PTXFunctionalLine()
             handoff_window_base_init.leadingWhiteSpace = line.leadingWhiteSpace
-            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_dispatch_descriptor_v0_handoff_window_base(trace_ray_ID)))
+            handoff_window_base_init.buildString('mov.b64', (handoff_window_base_reg, rtcore_dispatch_descriptor_v0_handoff_window_base(trace_slot)))
 
             launch_width_rounded_init = PTXFunctionalLine()
             launch_width_rounded_init.leadingWhiteSpace = line.leadingWhiteSpace
@@ -1997,7 +2034,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 (
                     context_index_reg,
                     context_index_reg,
-                    str(trace_ray_ID * RTCORE_MAX_CONTEXTS_PER_TRACE_SITE),
+                    str(trace_slot * RTCORE_MAX_CONTEXTS_PER_TRACE_SITE),
                 ),
             )
 
@@ -2016,7 +2053,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 (
                     handoff_window_index_reg,
                     global_warp_index_reg,
-                    str(trace_ray_ID * RTCORE_MAX_WINDOWS_PER_TRACE_SITE),
+                    str(trace_slot * RTCORE_MAX_WINDOWS_PER_TRACE_SITE),
                 ),
             )
 
@@ -4746,7 +4783,10 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
         rtcore_raise_compiler_lowering_contract_violation(
             'resident megakernel continuation requires symbolic RT submit'
         )
-    if ptx_shader.getShaderType() != ShaderType.Ray_generation:
+    if ptx_shader.getShaderType() not in (
+            ShaderType.Ray_generation,
+            ShaderType.Closest_hit,
+            ShaderType.Miss):
         return []
 
     begin_pattern = re.compile(
