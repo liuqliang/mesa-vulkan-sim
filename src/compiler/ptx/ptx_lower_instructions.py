@@ -1900,6 +1900,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 for component in range(3)
             ]
             lane_slot_reg = '%rt_lane_slot_' + str(trace_ray_ID)
+            trace_depth_reg = '%rt_trace_depth_' + str(trace_ray_ID)
             launch_yz_index_reg = '%rt_launch_yz_index_' + str(trace_ray_ID)
             context_index_reg = '%rt_context_index_' + str(trace_ray_ID)
             launch_width_rounded_reg = '%rt_launch_width_rounded_' + str(trace_ray_ID)
@@ -1942,6 +1943,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             global_index_declarations = []
             for global_index_reg in (
                     lane_slot_reg,
+            ) + ((trace_depth_reg,) if precise_megakernel_continuation else ()) + (
                     launch_yz_index_reg,
                     context_index_reg,
                     launch_width_rounded_reg,
@@ -2080,14 +2082,25 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             context_trace_site_index_init = PTXFunctionalLine()
             context_trace_site_index_init.leadingWhiteSpace = line.leadingWhiteSpace
-            context_trace_site_index_init.buildString(
-                'add.u32',
-                (
-                    context_index_reg,
-                    context_index_reg,
-                    str(trace_slot * RTCORE_MAX_CONTEXTS_PER_TRACE_SITE),
-                ),
-            )
+            if precise_megakernel_continuation:
+                context_trace_site_index_init.buildString(
+                    'mad.lo.u32',
+                    (
+                        context_index_reg,
+                        trace_depth_reg,
+                        str(RTCORE_MAX_CONTEXTS_PER_TRACE_SITE),
+                        context_index_reg,
+                    ),
+                )
+            else:
+                context_trace_site_index_init.buildString(
+                    'add.u32',
+                    (
+                        context_index_reg,
+                        context_index_reg,
+                        str(trace_slot * RTCORE_MAX_CONTEXTS_PER_TRACE_SITE),
+                    ),
+                )
 
             context_lane_offset_init = PTXFunctionalLine()
             context_lane_offset_init.leadingWhiteSpace = line.leadingWhiteSpace
@@ -2099,14 +2112,25 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
             handoff_window_index_init = PTXFunctionalLine()
             handoff_window_index_init.leadingWhiteSpace = line.leadingWhiteSpace
-            handoff_window_index_init.buildString(
-                'add.u32',
-                (
-                    handoff_window_index_reg,
-                    global_warp_index_reg,
-                    str(trace_slot * RTCORE_MAX_WINDOWS_PER_TRACE_SITE),
-                ),
-            )
+            if precise_megakernel_continuation:
+                handoff_window_index_init.buildString(
+                    'mad.lo.u32',
+                    (
+                        handoff_window_index_reg,
+                        trace_depth_reg,
+                        str(RTCORE_MAX_WINDOWS_PER_TRACE_SITE),
+                        global_warp_index_reg,
+                    ),
+                )
+            else:
+                handoff_window_index_init.buildString(
+                    'add.u32',
+                    (
+                        handoff_window_index_reg,
+                        global_warp_index_reg,
+                        str(trace_slot * RTCORE_MAX_WINDOWS_PER_TRACE_SITE),
+                    ),
+                )
 
             handoff_window_offset_init = PTXFunctionalLine()
             handoff_window_offset_init.leadingWhiteSpace = line.leadingWhiteSpace
@@ -2160,6 +2184,15 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 ),
             ]
 
+            trace_allocation_depth_setup = []
+            if precise_megakernel_continuation:
+                trace_allocation_depth_setup = [
+                    PTXLine.createNewLine(
+                        line.leadingWhiteSpace + 'rt_trace_depth ' +
+                        trace_depth_reg + ';\n'
+                    ),
+                ]
+
             trace_submit_setup = [
                 preflight_marker,
                 descriptor_marker,
@@ -2181,6 +2214,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
                 launch_x_warp_index_init,
                 global_warp_index_init,
                 lane_slot_init,
+            ] + trace_allocation_depth_setup + [
                 context_index_init,
                 context_trace_site_index_init,
                 context_lane_offset_init,
