@@ -18,6 +18,128 @@ struct vsim_pipeline_stage {
    const VkSpecializationInfo *spec_info;
 };
 
+#define VSIM_KHR_CONTINUATION_STACK_DEFAULT_BYTES 4096u
+#define VSIM_KHR_CONTINUATION_STACK_MAX_BYTES (1u << 20)
+#define VSIM_KHR_CALLABLE_DEPTH_CAPACITY 8u
+
+static bool
+vsim_khr_continuation_stack_capacity(uint32_t *capacity_out)
+{
+   const char *text = getenv("VULKAN_SIM_RTCORE_CONTINUATION_STACK_BYTES");
+   if (!text || !text[0]) {
+      *capacity_out = VSIM_KHR_CONTINUATION_STACK_DEFAULT_BYTES;
+      return true;
+   }
+   char *end = NULL;
+   unsigned long value = strtoul(text, &end, 10);
+   if (!end || end == text || *end != '\0' || value == 0 ||
+       (value & 7u) != 0 || value > VSIM_KHR_CONTINUATION_STACK_MAX_BYTES) {
+      return false;
+   }
+   *capacity_out = (uint32_t)value;
+   return true;
+}
+
+static bool
+vsim_validate_compiled_continuation_stack(
+   const VkRayTracingPipelineCreateInfoKHR *info,
+   char shader_paths[20][200])
+{
+   const char *candidate =
+      getenv("VULKAN_SIM_RTCORE_MEGAKERNEL_CONTINUATION_STACK");
+   if (!candidate || strcmp(candidate, "1"))
+      return true;
+
+   uint32_t capacity = 0;
+   if (!vsim_khr_continuation_stack_capacity(&capacity)) {
+      fprintf(stderr,
+              "LVP: invalid VULKAN_SIM_RTCORE_CONTINUATION_STACK_BYTES; "
+              "expected an 8-byte-aligned integer in [8, 1048576]\n");
+      return false;
+   }
+
+   uint32_t max_trace_frame = 0;
+   uint32_t max_callable_frame = 0;
+   uint32_t max_report_frame = 0;
+   for (uint32_t index = 0; index < info->stageCount; ++index) {
+      if (!shader_paths[index][0])
+         continue;
+      FILE *file = fopen(shader_paths[index], "r");
+      if (!file) {
+         fprintf(stderr,
+                 "LVP: cannot inspect compiled continuation profile %s\n",
+                 shader_paths[index]);
+         return false;
+      }
+      char line[1024];
+      while (fgets(line, sizeof(line), file)) {
+         char *marker = strstr(line, "rtcore_continuation_push site=");
+         if (!marker)
+            continue;
+         unsigned site = 0;
+         unsigned frame_bytes = 0;
+         char kind[16] = {0};
+         if (sscanf(marker,
+                    "rtcore_continuation_push site=%u kind=%15s "
+                    "frame_bytes=%u",
+                    &site, kind, &frame_bytes) != 3 ||
+             frame_bytes < 32 || (frame_bytes & 7u) != 0) {
+            fclose(file);
+            fprintf(stderr,
+                    "LVP: malformed compiled continuation frame marker\n");
+            return false;
+         }
+         if (!strcmp(kind, "trace"))
+            max_trace_frame = MAX2(max_trace_frame, frame_bytes);
+         else if (!strcmp(kind, "callable"))
+            max_callable_frame = MAX2(max_callable_frame, frame_bytes);
+         else if (!strcmp(kind, "report"))
+            max_report_frame = MAX2(max_report_frame, frame_bytes);
+         else {
+            fclose(file);
+            fprintf(stderr,
+                    "LVP: unknown compiled continuation frame kind %s\n",
+                    kind);
+            return false;
+         }
+      }
+      fclose(file);
+   }
+
+   const uint64_t required =
+      (uint64_t)info->maxPipelineRayRecursionDepth * max_trace_frame +
+      (uint64_t)VSIM_KHR_CALLABLE_DEPTH_CAPACITY * max_callable_frame +
+      max_report_frame;
+   if (required > capacity) {
+      fprintf(stderr,
+              "LVP: RTCORE_KHR_PIPELINE_STACK_CONFIG required_bytes=%llu "
+              "capacity_bytes=%u trace_frame_bytes=%u trace_depth=%u "
+              "callable_frame_bytes=%u callable_depth=%u "
+              "report_frame_bytes=%u validated=0 "
+              "reason=aggregate_capacity_exceeded_before_execution\n",
+              (unsigned long long)required, capacity, max_trace_frame,
+              info->maxPipelineRayRecursionDepth, max_callable_frame,
+              VSIM_KHR_CALLABLE_DEPTH_CAPACITY, max_report_frame);
+      fprintf(stderr,
+              "LVP: resident continuation pipeline requires %llu bytes "
+              "but configured per-lane capacity is %u bytes "
+              "(trace_frame=%u trace_depth=%u callable_frame=%u "
+              "callable_depth=%u report_frame=%u)\n",
+              (unsigned long long)required, capacity, max_trace_frame,
+              info->maxPipelineRayRecursionDepth, max_callable_frame,
+              VSIM_KHR_CALLABLE_DEPTH_CAPACITY, max_report_frame);
+      return false;
+   }
+   printf("LVP: RTCORE_KHR_PIPELINE_STACK_CONFIG required_bytes=%llu "
+          "capacity_bytes=%u trace_frame_bytes=%u trace_depth=%u "
+          "callable_frame_bytes=%u callable_depth=%u "
+          "report_frame_bytes=%u validated=1\n",
+          (unsigned long long)required, capacity, max_trace_frame,
+          info->maxPipelineRayRecursionDepth, max_callable_frame,
+          VSIM_KHR_CALLABLE_DEPTH_CAPACITY, max_report_frame);
+   return true;
+}
+
 
 static bool gpgpusim_initialized = false;
 static int shader_ID = 0;
@@ -29,6 +151,16 @@ vsim_validate_ray_tracing_pipeline_capabilities(
 {
    const char *continuation_candidate =
       getenv("VULKAN_SIM_RTCORE_MEGAKERNEL_CONTINUATION_STACK");
+   uint32_t continuation_capacity = 0;
+   if (continuation_candidate && !strcmp(continuation_candidate, "1") &&
+       (!vsim_khr_continuation_stack_capacity(&continuation_capacity) ||
+        info->stageCount > 20)) {
+      fprintf(stderr,
+              "LVP: invalid resident continuation capacity or stage count "
+              "(stageCount=%u)\n",
+              info->stageCount);
+      return vk_error(device, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
    if (continuation_candidate && !strcmp(continuation_candidate, "1") &&
        (info->maxPipelineRayRecursionDepth == 0 ||
         info->maxPipelineRayRecursionDepth > 8)) {
@@ -160,14 +292,14 @@ vsim_compile_ray_tracing_pipeline(
    const VkRayTracingPipelineCreateInfoKHR *info)
 {
    printf("LVP: Compiling ray tracing pipeline...\n");
-   VkResult result;
+   VkResult result = VK_SUCCESS;
    LVP_FROM_HANDLE(lvp_pipeline_layout, layout, info->layout);
 
    void *pipeline_ctx = ralloc_context(NULL);
    struct vsim_pipeline_stage *stages =
       rzalloc_array(pipeline_ctx, struct vsim_pipeline_stage, info->stageCount);
 
-   char shaderPaths[20][200];
+   char shaderPaths[20][200] = {{0}};
    for (uint32_t i = 0; i < info->stageCount; i++) {
       printf("LVP: Compiling shader stage %d\n", i);
       const VkPipelineShaderStageCreateInfo *sinfo = &info->pStages[i];
@@ -201,6 +333,11 @@ vsim_compile_ray_tracing_pipeline(
    // Vulkan-Sim additions
    printf("LVP: run_rt_translation_passes\n");
    run_rt_translation_passes();
+
+   if (!vsim_validate_compiled_continuation_stack(info, shaderPaths)) {
+      ralloc_free(pipeline_ctx);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
 
    for (uint32_t i = 0; i < info->stageCount; i++) {
       if(stages[i].stage >= MESA_SHADER_RAYGEN && stages[i].stage <= MESA_SHADER_CALLABLE) {
@@ -264,7 +401,12 @@ lvp_ray_tracing_pipeline_create(
 
 
    // Ray tracing shaders
-   vsim_compile_ray_tracing_pipeline(pipeline, pCreateInfo);
+   result = vsim_compile_ray_tracing_pipeline(pipeline, pCreateInfo);
+   if (result != VK_SUCCESS) {
+      vk_free(&device->vk.alloc, pipeline->group_handles);
+      vk_free(&device->vk.alloc, pipeline);
+      return result;
+   }
 
    // Allocate memory for shader groups
    // Don't need the actual binary since GPGPU-Sim runs PTX
