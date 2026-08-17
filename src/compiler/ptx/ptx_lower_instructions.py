@@ -28,6 +28,7 @@
 
 from enum import unique
 from ptx_parser import *
+import copy
 import sys
 import os
 import re
@@ -129,6 +130,9 @@ RTCORE_PATH_MODE_CUSTOM_ALIASES = (
 RTCORE_CONTINUATION_MODEL_OFF = 'off'
 RTCORE_CONTINUATION_MODEL_SYNTHETIC_SPLIT = 'synthetic_split'
 RTCORE_CONTINUATION_MODEL_ORACLE_SHADER_BOUNDARY = 'oracle_shader_boundary'
+RTCORE_MEGAKERNEL_CONTINUATION_STACK_ENV = (
+    'VULKAN_SIM_RTCORE_MEGAKERNEL_CONTINUATION_STACK'
+)
 RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV = (
     'VULKAN_SIM_RTCORE_ABI_V04_SHADOW_PUBLICATION'
 )
@@ -291,6 +295,18 @@ RTCORE_OBJECT_RAY_BUILTINS = (
 def rtcore_env_flag_enabled(name):
     value = os.environ.get(name, '0')
     return value != '' and value != '0'
+
+
+def rtcore_megakernel_continuation_stack_enabled():
+    value = os.environ.get(RTCORE_MEGAKERNEL_CONTINUATION_STACK_ENV, '0')
+    if value in ('', '0'):
+        return False
+    if value == '1':
+        return True
+    rtcore_raise_compiler_lowering_contract_violation(
+        '%s must be exactly 0 or 1' %
+        RTCORE_MEGAKERNEL_CONTINUATION_STACK_ENV
+    )
 
 
 def rtcore_path_mode():
@@ -1593,6 +1609,12 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             'original Vulkan-Sim lowering' %
             shader_type.name
         )
+    if (has_trace_ray and
+            rtcore_megakernel_continuation_stack_enabled() and
+            not rtcore_symbolic_submit_enabled()):
+        rtcore_raise_compiler_lowering_contract_violation(
+            'resident megakernel continuation requires symbolic RT submit'
+        )
 
     trace_ray_ID = 0
     skip_lines = -1
@@ -1616,6 +1638,14 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         traversal_finished_declaration.buildString(DeclarationType.Register, None, '.u32', traversal_finished_reg)
 
         symbolic_rt_submit = rtcore_symbolic_submit_enabled()
+        precise_megakernel_continuation = (
+            rtcore_megakernel_continuation_stack_enabled()
+        )
+        if precise_megakernel_continuation and trace_ray_condition:
+            rtcore_raise_compiler_lowering_contract_violation(
+                'resident megakernel continuation V0.2 does not support '
+                'predicated trace_ray sites'
+            )
         v04_shadow_publication = rtcore_v04_shadow_publication_enabled()
         v04_continuation_lifecycle = (
             rtcore_v04_continuation_lifecycle_enabled()
@@ -2701,6 +2731,14 @@ def translate_trace_ray(ptx_shader, shaderIDs):
 
         newLines = [traversal_finished_declaration]
         newLines.extend(trace_submit_setup)
+        if precise_megakernel_continuation:
+            begin_marker = PTXLine('')
+            begin_marker.fullLine = (
+                line.leadingWhiteSpace +
+                '// rtcore_megakernel_continuation_begin site=%u\n' %
+                trace_ray_ID
+            )
+            newLines.append(begin_marker)
         newLines.extend(trace_ray_lines)
         newLines.extend(continuation_anchor_lines)
         newLines.append(PTXLine('\n'))
@@ -2710,6 +2748,14 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         newLines.append(PTXLine('\n'))
         newLines.extend(terminal_final_dispatch_lines)
         newLines.extend(trace_retire)
+        if precise_megakernel_continuation:
+            end_marker = PTXLine('')
+            end_marker.fullLine = (
+                line.leadingWhiteSpace +
+                '// rtcore_megakernel_continuation_end site=%u\n' %
+                trace_ray_ID
+            )
+            newLines.append(end_marker)
 
 
         ptx_shader.lines[index:index + 1] = newLines
@@ -4406,6 +4452,421 @@ setp.ge.u32 %bigger_2, %launch_ID_2, %launch_Size_2;
     ptx_shader.addToStart(lines)
 
 
+RTCORE_CONTINUATION_REGISTER_PATTERN = re.compile(
+    r'%[A-Za-z_][A-Za-z0-9_.$]*'
+)
+RTCORE_CONTINUATION_PURE_REMAT_OPS = frozenset((
+    'mov', 'cvt', 'add', 'sub', 'mul', 'mad', 'and', 'or', 'xor', 'not',
+    'shl', 'shr', 'min', 'max', 'abs', 'neg', 'selp', 'setp',
+))
+RTCORE_CONTINUATION_NO_DEST_OPS = frozenset((
+    'st', 'bra', 'ret', 'exit', 'membar', 'bar', 'call',
+    'rt_retire_context', 'end_trace_ray',
+))
+
+
+def rtcore_continuation_registers(text):
+    if not text:
+        return set()
+    return set(RTCORE_CONTINUATION_REGISTER_PATTERN.findall(text))
+
+
+def rtcore_continuation_opcode(line):
+    if line.instructionClass != InstructionClass.Functional:
+        return ''
+    full_function = getattr(line, 'fullFunction', '')
+    if not full_function:
+        command = getattr(line, 'command', '').strip()
+        if not command:
+            return ''
+        full_function = command.split(None, 1)[0]
+    if full_function.startswith('@'):
+        command = getattr(line, 'command', '').strip()
+        fields = command.split(None, 2)
+        if len(fields) < 2:
+            return ''
+        full_function = fields[1]
+    return full_function.split('.')[0]
+
+
+def rtcore_continuation_condition_registers(line):
+    explicit = rtcore_continuation_registers(
+        getattr(line, 'condition', '')
+    )
+    if explicit:
+        return explicit
+    match = re.match(r'\s*@!?(%[A-Za-z_][A-Za-z0-9_.$]*)', line.fullLine)
+    return {match.group(1)} if match else set()
+
+
+def rtcore_continuation_line_is_predicated(line):
+    return bool(rtcore_continuation_condition_registers(line))
+
+
+def rtcore_continuation_args(line):
+    full_function = getattr(line, 'fullFunction', '')
+    if not full_function.startswith('@'):
+        return list(getattr(line, 'args', ()))
+    command = getattr(line, 'command', '').strip()
+    fields = command.split(None, 2)
+    if len(fields) < 3:
+        return []
+    args_text = fields[2]
+    if args_text.endswith(';'):
+        args_text = args_text[:-1]
+    return [argument.strip() for argument in args_text.split(',')]
+
+
+def rtcore_continuation_def_use(line):
+    if line.instructionClass != InstructionClass.Functional:
+        return set(), set()
+    args = rtcore_continuation_args(line)
+    condition_uses = rtcore_continuation_condition_registers(line)
+    opcode = rtcore_continuation_opcode(line)
+    arg_registers = [rtcore_continuation_registers(arg) for arg in args]
+    if opcode == 'rt_submit':
+        definitions = arg_registers[0] if arg_registers else set()
+        uses = set().union(*arg_registers[1:]) if len(arg_registers) > 1 else set()
+        return definitions, uses | condition_uses
+    if (opcode in RTCORE_CONTINUATION_NO_DEST_OPS or
+            opcode.startswith('st') or opcode.startswith('atom')):
+        uses = set().union(*arg_registers) if arg_registers else set()
+        return set(), uses | condition_uses
+    if not arg_registers:
+        return set(), condition_uses
+    definitions = set(arg_registers[0])
+    uses = set().union(*arg_registers[1:]) if len(arg_registers) > 1 else set()
+    return definitions, uses | condition_uses
+
+
+def rtcore_continuation_scalar_declarations(ptx_shader):
+    declarations = {}
+    for line in ptx_shader.lines:
+        if (line.instructionClass != InstructionClass.VariableDeclaration or
+                getattr(line, 'declarationType', None) != DeclarationType.Register or
+                line.isVector()):
+            continue
+        declarations[line.variableName] = line.variableType
+    return declarations
+
+
+def rtcore_continuation_type_layout(variable_type):
+    if variable_type == '.pred':
+        return 4, 4, '.u32'
+    match = re.fullmatch(r'\.([busf])(8|16|32|64)', variable_type)
+    if match is None:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'unsupported continuation register type %s' % variable_type
+        )
+    size = int(match.group(2)) // 8
+    return size, min(max(size, 1), 8), variable_type
+
+
+def rtcore_continuation_align(value, alignment):
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def rtcore_continuation_make_line(text, whitespace):
+    line = PTXLine.createNewLine(whitespace + text + '\n')
+    return line
+
+
+def rtcore_continuation_marker(text, whitespace):
+    line = PTXLine('')
+    line.fullLine = whitespace + '// ' + text + '\n'
+    return line
+
+
+def rtcore_continuation_remat_candidates(
+        cross_live, reaching_defs, definition_counts, region_definitions,
+        def_use_by_index, lines):
+    candidates = set()
+    dependencies = {}
+    for register in sorted(cross_live):
+        definition_index = reaching_defs[register]
+        line = lines[definition_index]
+        opcode = rtcore_continuation_opcode(line)
+        _, uses = def_use_by_index[definition_index]
+        register_dependencies = uses - rtcore_continuation_condition_registers(
+            line
+        )
+        if (
+                opcode not in RTCORE_CONTINUATION_PURE_REMAT_OPS or
+                rtcore_continuation_line_is_predicated(line) or
+                definition_counts.get(register, 0) != 1 or
+                register in region_definitions or
+                not register_dependencies.issubset(cross_live)
+        ):
+            continue
+        # Each accepted producer has unit cost. One cloned instruction is
+        # strictly cheaper than the avoided local store plus local load.
+        candidates.add(register)
+        dependencies[register] = register_dependencies
+
+    # Remove cycles and candidates depending on a candidate that cannot be
+    # ordered before it. Original definition order is the first-version DAG
+    # authority.
+    changed = True
+    while changed:
+        changed = False
+        for register in tuple(candidates):
+            definition_index = reaching_defs[register]
+            invalid_dependency = any(
+                dependency in candidates and
+                reaching_defs[dependency] >= definition_index
+                for dependency in dependencies[register]
+            )
+            if invalid_dependency:
+                candidates.remove(register)
+                changed = True
+    return candidates, dependencies
+
+
+def rtcore_lower_resident_megakernel_continuations(ptx_shader):
+    if not rtcore_megakernel_continuation_stack_enabled():
+        return []
+    if not rtcore_symbolic_submit_enabled():
+        rtcore_raise_compiler_lowering_contract_violation(
+            'resident megakernel continuation requires symbolic RT submit'
+        )
+    if ptx_shader.getShaderType() != ShaderType.Ray_generation:
+        return []
+
+    begin_pattern = re.compile(
+        r'rtcore_megakernel_continuation_begin site=(\d+)'
+    )
+    end_pattern = re.compile(
+        r'rtcore_megakernel_continuation_end site=(\d+)'
+    )
+    open_sites = {}
+    regions = []
+    for index, line in enumerate(ptx_shader.lines):
+        begin = begin_pattern.search(line.fullLine)
+        end = end_pattern.search(line.fullLine)
+        if begin:
+            site = int(begin.group(1))
+            if site in open_sites:
+                rtcore_raise_compiler_lowering_contract_violation(
+                    'duplicate continuation begin marker for site %u' % site
+                )
+            open_sites[site] = index
+        if end:
+            site = int(end.group(1))
+            if site not in open_sites:
+                rtcore_raise_compiler_lowering_contract_violation(
+                    'continuation end without begin for site %u' % site
+                )
+            regions.append((site, open_sites.pop(site), index))
+    if open_sites:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'unterminated resident continuation region'
+        )
+    if not regions:
+        return []
+    regions.sort(key=lambda region: region[1])
+    for previous, current in zip(regions, regions[1:]):
+        if previous[2] >= current[1]:
+            rtcore_raise_compiler_lowering_contract_violation(
+                'overlapping resident continuation regions'
+            )
+
+    declarations = rtcore_continuation_scalar_declarations(ptx_shader)
+    def_use_by_index = [
+        rtcore_continuation_def_use(line) for line in ptx_shader.lines
+    ]
+    definition_indices = {}
+    for index, (definitions, _) in enumerate(def_use_by_index):
+        for register in definitions:
+            definition_indices.setdefault(register, []).append(index)
+
+    plans = []
+    for site, begin_index, end_index in regions:
+        submit_indices = [
+            index for index in range(begin_index + 1, end_index)
+            if rtcore_continuation_opcode(ptx_shader.lines[index]) == 'rt_submit'
+        ]
+        retire_indices = [
+            index for index in range(begin_index + 1, end_index)
+            if rtcore_continuation_opcode(ptx_shader.lines[index]) ==
+            'rt_retire_context'
+        ]
+        if not submit_indices or len(retire_indices) != 1:
+            rtcore_raise_compiler_lowering_contract_violation(
+                'site %u requires at least one submit and exactly one retire' %
+                site
+            )
+        first_submit = submit_indices[0]
+        retire_index = retire_indices[0]
+        if first_submit >= retire_index:
+            rtcore_raise_compiler_lowering_contract_violation(
+                'site %u has invalid submit/retire ordering' % site
+            )
+
+        post_live = set()
+        post_uses_union = set()
+        for index in range(len(ptx_shader.lines) - 1, retire_index, -1):
+            definitions, uses = def_use_by_index[index]
+            post_uses_union.update(uses)
+            # A predicated definition does not kill the incoming value on
+            # lanes where the predicate is false. Unpredicated definitions
+            # start a new post-resume live range and therefore kill it.
+            if not rtcore_continuation_line_is_predicated(
+                    ptx_shader.lines[index]):
+                post_live.difference_update(definitions)
+            post_live.update(uses)
+        # Mesa shader SSA names use one logical definition. Reused compiler
+        # scratch/named registers are conservatively retained if mentioned
+        # after resume; loading an extra value before a later overwrite is
+        # safe, while an incomplete control-flow kill would not be.
+        post_live.update(
+            register for register in post_uses_union
+            if not register.startswith('%ssa_')
+        )
+        region_definitions = set()
+        for definitions, _ in def_use_by_index[first_submit:retire_index + 1]:
+            region_definitions.update(definitions)
+
+        reaching_defs = {}
+        definition_counts = {}
+        for register in post_live:
+            indices = definition_indices.get(register, [])
+            before = [index for index in indices if index < first_submit]
+            inside = [
+                index for index in indices
+                if first_submit <= index <= retire_index
+            ]
+            if not before or inside or register not in declarations:
+                continue
+            reaching_defs[register] = before[-1]
+            definition_counts[register] = len(before)
+        cross_live = set(reaching_defs)
+
+        rematerialized, dependencies = rtcore_continuation_remat_candidates(
+            cross_live,
+            reaching_defs,
+            definition_counts,
+            region_definitions,
+            def_use_by_index,
+            ptx_shader.lines,
+        )
+        spilled = sorted(cross_live - rematerialized)
+
+        slots = {}
+        frame_bytes = 0
+        for register in spilled:
+            size, alignment, store_type = rtcore_continuation_type_layout(
+                declarations[register]
+            )
+            frame_bytes = rtcore_continuation_align(frame_bytes, alignment)
+            slots[register] = (frame_bytes, size, store_type)
+            frame_bytes += size
+        if frame_bytes:
+            frame_bytes = rtcore_continuation_align(frame_bytes, 8)
+
+        whitespace = ptx_shader.lines[first_submit].leadingWhiteSpace
+        frame_name = 'rt_continuation_frame_%u' % site
+        before_submit = []
+        after_retire = []
+        summary = (
+            'rtcore_megakernel_continuation_summary site=%u '
+            'cross_live=%u rematerialized=%u spilled=%u frame_bytes=%u '
+            'cta_resident=1 warp_resident=1 register_quota_resident=1'
+        ) % (
+            site, len(cross_live), len(rematerialized), len(spilled),
+            frame_bytes,
+        )
+        before_submit.append(rtcore_continuation_marker(summary, whitespace))
+        if frame_bytes:
+            frame_declaration = PTXLine('')
+            frame_declaration.fullLine = (
+                whitespace + '.local .align 8 .b8 %s[%u];\n' %
+                (frame_name, frame_bytes)
+            )
+            before_submit.append(frame_declaration)
+
+        for slot_index, register in enumerate(spilled):
+            offset, _, store_type = slots[register]
+            variable_type = declarations[register]
+            before_submit.append(rtcore_continuation_marker(
+                'rtcore_continuation_decision site=%u register=%s '
+                'action=spill offset=%u type=%s' %
+                (site, register, offset, variable_type),
+                whitespace,
+            ))
+            address = '[%s+%u]' % (frame_name, offset)
+            if variable_type == '.pred':
+                temp = '%%rt_continuation_pred_word_%u_%u' % (
+                    site, slot_index
+                )
+                before_submit.append(rtcore_continuation_make_line(
+                    '.reg .u32 %s;' % temp, whitespace
+                ))
+                before_submit.append(rtcore_continuation_make_line(
+                    'selp.u32 %s, 1, 0, %s;' % (temp, register),
+                    whitespace,
+                ))
+                before_submit.append(rtcore_continuation_make_line(
+                    'st.local.u32 %s, %s;' % (address, temp), whitespace
+                ))
+                after_retire.append(rtcore_continuation_make_line(
+                    'ld.local.u32 %s, %s;' % (temp, address), whitespace
+                ))
+                after_retire.append(rtcore_continuation_make_line(
+                    'setp.ne.u32 %s, %s, 0;' % (register, temp), whitespace
+                ))
+            else:
+                before_submit.append(rtcore_continuation_make_line(
+                    'st.local%s %s, %s;' %
+                    (store_type, address, register),
+                    whitespace,
+                ))
+                after_retire.append(rtcore_continuation_make_line(
+                    'ld.local%s %s, %s;' %
+                    (store_type, register, address),
+                    whitespace,
+                ))
+
+        for register in sorted(
+                rematerialized, key=lambda value: reaching_defs[value]):
+            before_submit.append(rtcore_continuation_marker(
+                'rtcore_continuation_decision site=%u register=%s '
+                'action=rematerialize producer=%s cost=1' % (
+                    site,
+                    register,
+                    rtcore_continuation_opcode(
+                        ptx_shader.lines[reaching_defs[register]]
+                    ),
+                ),
+                whitespace,
+            ))
+            after_retire.append(copy.deepcopy(
+                ptx_shader.lines[reaching_defs[register]]
+            ))
+
+        # Registers with no post-region use naturally end before the trace
+        # boundary; no runtime kill instruction is required.
+        plans.append({
+            'site': site,
+            'first_submit': first_submit,
+            'retire_index': retire_index,
+            'before_submit': before_submit,
+            'after_retire': after_retire,
+            'cross_live': sorted(cross_live),
+            'rematerialized': sorted(rematerialized),
+            'spilled': spilled,
+            'frame_bytes': frame_bytes,
+        })
+
+    for plan in reversed(plans):
+        ptx_shader.lines[plan['retire_index'] + 1:plan['retire_index'] + 1] = (
+            plan['after_retire']
+        )
+        ptx_shader.lines[plan['first_submit']:plan['first_submit']] = (
+            plan['before_submit']
+        )
+    return plans
+
+
 
 
 
@@ -4460,6 +4921,8 @@ def main():
 
         if shader.getShaderType() == ShaderType.Ray_generation:
             add_extra_thread_return(shader)
+
+        rtcore_lower_resident_megakernel_continuations(shader)
         
 
         shader.writeToFile()
