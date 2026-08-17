@@ -133,6 +133,13 @@ RTCORE_CONTINUATION_MODEL_ORACLE_SHADER_BOUNDARY = 'oracle_shader_boundary'
 RTCORE_MEGAKERNEL_CONTINUATION_STACK_ENV = (
     'VULKAN_SIM_RTCORE_MEGAKERNEL_CONTINUATION_STACK'
 )
+RTCORE_CONTINUATION_STACK_BYTES_ENV = (
+    'VULKAN_SIM_RTCORE_CONTINUATION_STACK_BYTES'
+)
+RTCORE_CONTINUATION_STACK_DEFAULT_BYTES = 4096
+RTCORE_CONTINUATION_FRAME_HEADER_BYTES = 32
+RTCORE_CONTINUATION_FRAME_MAGIC = 0x52544346
+RTCORE_CONTINUATION_FRAME_KIND_TRACE = 1
 RTCORE_KHR_OPERATION_STAGE_RULES = {
     FunctionalType.trace_ray: (
         ShaderType.Ray_generation,
@@ -329,6 +336,26 @@ def rtcore_megakernel_continuation_stack_enabled():
         '%s must be exactly 0 or 1' %
         RTCORE_MEGAKERNEL_CONTINUATION_STACK_ENV
     )
+
+
+def rtcore_continuation_stack_capacity_bytes():
+    text = os.environ.get(
+        RTCORE_CONTINUATION_STACK_BYTES_ENV,
+        str(RTCORE_CONTINUATION_STACK_DEFAULT_BYTES),
+    )
+    try:
+        capacity = int(text, 10)
+    except ValueError:
+        rtcore_raise_compiler_lowering_contract_violation(
+            '%s must be a decimal integer' %
+            RTCORE_CONTINUATION_STACK_BYTES_ENV
+        )
+    if capacity <= 0 or capacity % 8 != 0 or capacity > (1 << 20):
+        rtcore_raise_compiler_lowering_contract_violation(
+            '%s must be an 8-byte-aligned value in [8, 1048576]' %
+            RTCORE_CONTINUATION_STACK_BYTES_ENV
+        )
+    return capacity
 
 
 def rtcore_khr_operation_implementation_status(functional_type, shader_type):
@@ -4753,6 +4780,7 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
         )
     if not regions:
         return []
+    stack_capacity_bytes = rtcore_continuation_stack_capacity_bytes()
     regions.sort(key=lambda region: region[1])
     for previous, current in zip(regions, regions[1:]):
         if previous[2] >= current[1]:
@@ -4854,25 +4882,101 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             frame_bytes = rtcore_continuation_align(frame_bytes, 8)
 
         whitespace = ptx_shader.lines[first_submit].leadingWhiteSpace
-        frame_name = 'rt_continuation_frame_%u' % site
+        stack_name = 'rt_continuation_stack'
+        frame_body_bytes = frame_bytes
+        stack_frame_bytes = rtcore_continuation_align(
+            RTCORE_CONTINUATION_FRAME_HEADER_BYTES + frame_body_bytes,
+            8,
+        )
+        if stack_frame_bytes > stack_capacity_bytes:
+            rtcore_raise_compiler_lowering_contract_violation(
+                'continuation site %u frame requires %u bytes but stack '
+                'capacity is %u' % (
+                    site, stack_frame_bytes, stack_capacity_bytes
+                )
+            )
+        next_sp = '%%rt_continuation_next_sp_%u' % site
+        frame_base = '%%rt_continuation_frame_base_%u' % site
+        stack_base = '%%rt_continuation_stack_base_%u' % site
+        sp_u64 = '%%rt_continuation_sp_u64_%u' % site
+        previous_sp = '%%rt_continuation_previous_sp_%u' % site
+        header_word = '%%rt_continuation_header_word_%u' % site
+        overflow = '%%rt_continuation_overflow_%u' % site
+        underflow = '%%rt_continuation_underflow_%u' % site
+        invalid_header = '%%rt_continuation_invalid_header_%u' % site
         before_submit = []
         after_retire = []
         summary = (
             'rtcore_megakernel_continuation_summary site=%u '
             'cross_live=%u rematerialized=%u spilled=%u frame_bytes=%u '
+            'stack_frame_bytes=%u stack_capacity_bytes=%u push=1 pop=1 '
             'cta_resident=1 warp_resident=1 register_quota_resident=1'
         ) % (
             site, len(cross_live), len(rematerialized), len(spilled),
-            frame_bytes,
+            frame_body_bytes, stack_frame_bytes, stack_capacity_bytes,
         )
         before_submit.append(rtcore_continuation_marker(summary, whitespace))
-        if frame_bytes:
-            frame_declaration = PTXLine('')
-            frame_declaration.fullLine = (
-                whitespace + '.local .align 8 .b8 %s[%u];\n' %
-                (frame_name, frame_bytes)
-            )
-            before_submit.append(frame_declaration)
+        before_submit.extend([
+            rtcore_continuation_make_line(
+                '.reg .u32 %s;' % next_sp, whitespace),
+            rtcore_continuation_make_line(
+                '.reg .u32 %s;' % previous_sp, whitespace),
+            rtcore_continuation_make_line(
+                '.reg .u32 %s;' % header_word, whitespace),
+            rtcore_continuation_make_line(
+                '.reg .u64 %s;' % frame_base, whitespace),
+            rtcore_continuation_make_line(
+                '.reg .u64 %s;' % stack_base, whitespace),
+            rtcore_continuation_make_line(
+                '.reg .u64 %s;' % sp_u64, whitespace),
+            rtcore_continuation_make_line(
+                '.reg .pred %s;' % overflow, whitespace),
+            rtcore_continuation_make_line(
+                '.reg .pred %s;' % underflow, whitespace),
+            rtcore_continuation_make_line(
+                '.reg .pred %s;' % invalid_header, whitespace),
+            rtcore_continuation_marker(
+                'rtcore_continuation_push site=%u kind=trace '
+                'frame_bytes=%u' % (site, stack_frame_bytes), whitespace),
+            rtcore_continuation_make_line(
+                'add.u32 %s, %%rt_continuation_sp, %u;' %
+                (next_sp, stack_frame_bytes), whitespace),
+            rtcore_continuation_make_line(
+                'setp.gt.u32 %s, %s, %u;' %
+                (overflow, next_sp, stack_capacity_bytes), whitespace),
+            rtcore_continuation_make_line(
+                '@%s exit;' % overflow, whitespace),
+            rtcore_continuation_make_line(
+                'cvt.u64.u32 %s, %%rt_continuation_sp;' % sp_u64,
+                whitespace),
+            rtcore_continuation_make_line(
+                'mov.u64 %s, %s;' % (stack_base, stack_name),
+                whitespace),
+            rtcore_continuation_make_line(
+                'add.u64 %s, %s, %s;' %
+                (frame_base, stack_base, sp_u64), whitespace),
+            rtcore_continuation_make_line(
+                'st.local.u32 [%s+0], %u;' %
+                (frame_base, RTCORE_CONTINUATION_FRAME_MAGIC), whitespace),
+            rtcore_continuation_make_line(
+                'st.local.u32 [%s+4], %u;' %
+                (frame_base, RTCORE_CONTINUATION_FRAME_KIND_TRACE), whitespace),
+            rtcore_continuation_make_line(
+                'st.local.u32 [%s+8], %u;' % (frame_base, site), whitespace),
+            rtcore_continuation_make_line(
+                'st.local.u32 [%s+12], %u;' %
+                (frame_base, stack_frame_bytes), whitespace),
+            rtcore_continuation_make_line(
+                'st.local.u32 [%s+16], %%rt_continuation_sp;' % frame_base,
+                whitespace),
+            rtcore_continuation_make_line(
+                'st.local.u32 [%s+20], 1;' % frame_base, whitespace),
+            rtcore_continuation_make_line(
+                'st.local.u32 [%s+24], 0;' % frame_base, whitespace),
+            rtcore_continuation_make_line(
+                'st.local.u32 [%s+28], %u;' % (frame_base, site + 1),
+                whitespace),
+        ])
 
         for slot_index, register in enumerate(spilled):
             offset, _, store_type = slots[register]
@@ -4883,7 +4987,10 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
                 (site, register, offset, variable_type),
                 whitespace,
             ))
-            address = '[%s+%u]' % (frame_name, offset)
+            address = '[%s+%u]' % (
+                frame_base,
+                RTCORE_CONTINUATION_FRAME_HEADER_BYTES + offset,
+            )
             if variable_type == '.pred':
                 temp = '%%rt_continuation_pred_word_%u_%u' % (
                     site, slot_index
@@ -4916,6 +5023,47 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
                     whitespace,
                 ))
 
+        before_submit.append(rtcore_continuation_make_line(
+            'mov.u32 %%rt_continuation_sp, %s;' % next_sp,
+            whitespace,
+        ))
+
+        pop_prefix = [
+            rtcore_continuation_make_line(
+                'setp.lt.u32 %s, %%rt_continuation_sp, %u;' %
+                (underflow, stack_frame_bytes), whitespace),
+            rtcore_continuation_make_line(
+                '@%s exit;' % underflow, whitespace),
+            rtcore_continuation_make_line(
+                'sub.u32 %s, %%rt_continuation_sp, %u;' %
+                (previous_sp, stack_frame_bytes), whitespace),
+            rtcore_continuation_make_line(
+                'cvt.u64.u32 %s, %s;' % (sp_u64, previous_sp), whitespace),
+            rtcore_continuation_make_line(
+                'mov.u64 %s, %s;' % (stack_base, stack_name),
+                whitespace),
+            rtcore_continuation_make_line(
+                'add.u64 %s, %s, %s;' %
+                (frame_base, stack_base, sp_u64), whitespace),
+        ]
+        for offset, expected in (
+                (0, RTCORE_CONTINUATION_FRAME_MAGIC),
+                (4, RTCORE_CONTINUATION_FRAME_KIND_TRACE),
+                (8, site),
+                (12, stack_frame_bytes),
+                (16, None),
+                (28, site + 1)):
+            pop_prefix.append(rtcore_continuation_make_line(
+                'ld.local.u32 %s, [%s+%u];' %
+                (header_word, frame_base, offset), whitespace))
+            comparison = previous_sp if expected is None else str(expected)
+            pop_prefix.append(rtcore_continuation_make_line(
+                'setp.ne.u32 %s, %s, %s;' %
+                (invalid_header, header_word, comparison), whitespace))
+            pop_prefix.append(rtcore_continuation_make_line(
+                '@%s exit;' % invalid_header, whitespace))
+        after_retire[0:0] = pop_prefix
+
         for register in sorted(
                 rematerialized, key=lambda value: reaching_defs[value]):
             before_submit.append(rtcore_continuation_marker(
@@ -4933,6 +5081,16 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
                 ptx_shader.lines[reaching_defs[register]]
             ))
 
+        after_retire.extend([
+            rtcore_continuation_make_line(
+                'mov.u32 %%rt_continuation_sp, %s;' % previous_sp,
+                whitespace,
+            ),
+            rtcore_continuation_marker(
+                'rtcore_continuation_pop site=%u kind=trace '
+                'frame_bytes=%u' % (site, stack_frame_bytes), whitespace),
+        ])
+
         # Registers with no post-region use naturally end before the trace
         # boundary; no runtime kill instruction is required.
         plans.append({
@@ -4944,8 +5102,47 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             'cross_live': sorted(cross_live),
             'rematerialized': sorted(rematerialized),
             'spilled': spilled,
-            'frame_bytes': frame_bytes,
+            'frame_bytes': frame_body_bytes,
+            'stack_frame_bytes': stack_frame_bytes,
+            'stack_capacity_bytes': stack_capacity_bytes,
         })
+
+    common_whitespace = ptx_shader.lines[
+        plans[0]['first_submit']
+    ].leadingWhiteSpace
+    # PTX declarations must precede executable instructions.  Collect every
+    # site-local temporary declaration into the one function-local prologue;
+    # later sites still execute only their own push/pop sequence.
+    hoisted_declarations = []
+    for plan in plans:
+        executable_lines = []
+        for line in plan['before_submit']:
+            if line.fullLine.lstrip().startswith('.reg '):
+                hoisted_declarations.append(line)
+            else:
+                executable_lines.append(line)
+        plan['before_submit'] = executable_lines
+    common_prologue = [
+        rtcore_continuation_make_line(
+            '.local .align 8 .b8 rt_continuation_stack[%u];' %
+            stack_capacity_bytes,
+            common_whitespace,
+        ),
+        rtcore_continuation_make_line(
+            '.reg .u32 %rt_continuation_sp;', common_whitespace),
+    ] + hoisted_declarations + [
+        rtcore_continuation_make_line(
+            'mov.u32 %rt_continuation_sp, 0;', common_whitespace),
+        rtcore_continuation_marker(
+            'rtcore_continuation_stack capacity_bytes=%u header_bytes=%u '
+            'per_lane=1' % (
+                stack_capacity_bytes,
+                RTCORE_CONTINUATION_FRAME_HEADER_BYTES,
+            ),
+            common_whitespace,
+        ),
+    ]
+    plans[0]['before_submit'][0:0] = common_prologue
 
     for plan in reversed(plans):
         ptx_shader.lines[plan['retire_index'] + 1:plan['retire_index'] + 1] = (
