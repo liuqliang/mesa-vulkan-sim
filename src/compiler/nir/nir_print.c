@@ -2589,6 +2589,9 @@ print_intrinsic_instr_as_ptx(nir_intrinsic_instr *instr, print_state *state, ssa
       }
       fprintf(fp, "%s ", info->name); // Intrinsic function name
    }
+   else if (!strcmp(info->name, "execute_callable")){
+      fprintf(fp, "%s ", info->name); // Intrinsic function name
+   }
    else if (!strcmp(info->name, "load_ray_instance_custom_index")){
       if (info->has_dest) {
          ssa_register_info[instr->dest.ssa.index].type = UINT;

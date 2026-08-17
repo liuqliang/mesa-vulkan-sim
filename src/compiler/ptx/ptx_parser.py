@@ -275,6 +275,7 @@ class FunctionalType(Enum, metaclass=MetaEnum):
     report_ray_intersection = 'report_ray_intersection'
     ignore_ray_intersection = 'ignore_ray_intersection'
     terminate_ray = 'terminate_ray'
+    execute_callable = 'execute_callable'
     fsat = 'fsat'
     # get_intersection_index = 'get_intersection_index'
     run_intersection = 'run_intersection'

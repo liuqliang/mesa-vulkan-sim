@@ -133,6 +133,28 @@ RTCORE_CONTINUATION_MODEL_ORACLE_SHADER_BOUNDARY = 'oracle_shader_boundary'
 RTCORE_MEGAKERNEL_CONTINUATION_STACK_ENV = (
     'VULKAN_SIM_RTCORE_MEGAKERNEL_CONTINUATION_STACK'
 )
+RTCORE_KHR_OPERATION_STAGE_RULES = {
+    FunctionalType.trace_ray: (
+        ShaderType.Ray_generation,
+        ShaderType.Closest_hit,
+        ShaderType.Miss,
+    ),
+    FunctionalType.execute_callable: (
+        ShaderType.Ray_generation,
+        ShaderType.Closest_hit,
+        ShaderType.Miss,
+        ShaderType.Callable,
+    ),
+    FunctionalType.report_ray_intersection: (
+        ShaderType.Intersection,
+    ),
+    FunctionalType.ignore_ray_intersection: (
+        ShaderType.Any_hit,
+    ),
+    FunctionalType.terminate_ray: (
+        ShaderType.Any_hit,
+    ),
+}
 RTCORE_ABI_V04_SHADOW_PUBLICATION_ENV = (
     'VULKAN_SIM_RTCORE_ABI_V04_SHADOW_PUBLICATION'
 )
@@ -307,6 +329,79 @@ def rtcore_megakernel_continuation_stack_enabled():
         '%s must be exactly 0 or 1' %
         RTCORE_MEGAKERNEL_CONTINUATION_STACK_ENV
     )
+
+
+def rtcore_khr_operation_implementation_status(functional_type, shader_type):
+    if (functional_type == FunctionalType.trace_ray and
+            shader_type == ShaderType.Ray_generation):
+        return 'enabled'
+    if functional_type in (
+            FunctionalType.report_ray_intersection,
+            FunctionalType.ignore_ray_intersection,
+            FunctionalType.terminate_ray):
+        return 'enabled'
+    return 'legal_but_not_enabled'
+
+
+def rtcore_validate_khr_shader_operations(
+        ptx_shader, reject_unimplemented=False):
+    shader_type = ptx_shader.getShaderType()
+    records = []
+    for index, line in enumerate(ptx_shader.lines):
+        if line.instructionClass != InstructionClass.Functional:
+            continue
+        functional_type = line.functionalType
+        allowed_stages = RTCORE_KHR_OPERATION_STAGE_RULES.get(
+            functional_type
+        )
+        if allowed_stages is None:
+            continue
+        if shader_type not in allowed_stages:
+            rtcore_raise_compiler_lowering_contract_violation(
+                'strict Vulkan KHR stage violation: %s is not legal in %s '
+                'shader' % (functional_type.name, shader_type.name)
+            )
+        implementation_status = rtcore_khr_operation_implementation_status(
+            functional_type, shader_type
+        )
+        record = {
+            'line_index': index,
+            'operation': functional_type.name,
+            'stage': shader_type.name,
+            'legality': 'legal',
+            'implementation': implementation_status,
+        }
+        records.append(record)
+        if reject_unimplemented and implementation_status != 'enabled':
+            rtcore_raise_compiler_lowering_contract_violation(
+                'strict Vulkan KHR operation %s is legal in %s shader but '
+                'is not enabled by the current resident continuation '
+                'candidate' % (functional_type.name, shader_type.name)
+            )
+    return records
+
+
+def rtcore_prepare_khr_operation_metadata(ptx_shader):
+    records = rtcore_validate_khr_shader_operations(
+        ptx_shader,
+        reject_unimplemented=rtcore_symbolic_submit_enabled(),
+    )
+    if not rtcore_megakernel_continuation_stack_enabled():
+        return records
+    for record in reversed(records):
+        line = ptx_shader.lines[record['line_index']]
+        marker = PTXLine(
+            line.leadingWhiteSpace +
+            '// rtcore_khr_operation_metadata operation=%s stage=%s '
+            'legality=%s implementation=%s\n' % (
+                record['operation'],
+                record['stage'],
+                record['legality'],
+                record['implementation'],
+            )
+        )
+        ptx_shader.lines[record['line_index']:record['line_index']] = [marker]
+    return records
 
 
 def rtcore_path_mode():
@@ -1599,15 +1694,10 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         line.functionalType == FunctionalType.trace_ray
         for line in ptx_shader.lines
     )
-    if (
-            has_trace_ray and
-            shader_type != ShaderType.Ray_generation and
-            rtcore_symbolic_submit_enabled()):
-        rtcore_raise_compiler_lowering_contract_violation(
-            'nested trace_ray is unsupported by the custom RT path in %s '
-            'shader; use VULKAN_SIM_RTCORE_PATH_MODE=legacy to preserve the '
-            'original Vulkan-Sim lowering' %
-            shader_type.name
+    if has_trace_ray:
+        rtcore_validate_khr_shader_operations(
+            ptx_shader,
+            reject_unimplemented=rtcore_symbolic_submit_enabled(),
         )
     if (has_trace_ray and
             rtcore_megakernel_continuation_stack_enabled() and
@@ -4893,6 +4983,7 @@ def main():
     for shader in shaders:
         print("Translating {}".format(shader.filePath))
         rtcore_prepare_continuation_ptx_profile(shader)
+        rtcore_prepare_khr_operation_metadata(shader)
         add_consts(shader)
         add_temps(shader)
 
