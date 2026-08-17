@@ -1641,6 +1641,7 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         precise_megakernel_continuation = (
             rtcore_megakernel_continuation_stack_enabled()
         )
+        trace_ray_condition = line.condition
         if precise_megakernel_continuation and trace_ray_condition:
             rtcore_raise_compiler_lowering_contract_violation(
                 'resident megakernel continuation V0.2 does not support '
@@ -1673,7 +1674,6 @@ def translate_trace_ray(ptx_shader, shaderIDs):
         args[8:9] = directionRegNames[:3]
         args[6:7] = originRegNames[:3]
         args.append(traversal_finished_reg)
-        trace_ray_condition = line.condition
         trace_ray_lines = [line]
         continuation_anchor_lines = []
         if symbolic_rt_submit:
