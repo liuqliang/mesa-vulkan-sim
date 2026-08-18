@@ -2188,8 +2188,8 @@ def translate_trace_ray(ptx_shader, shaderIDs):
             if precise_megakernel_continuation:
                 trace_allocation_depth_setup = [
                     PTXLine.createNewLine(
-                        line.leadingWhiteSpace + 'rt_trace_depth ' +
-                        trace_depth_reg + ';\n'
+                        line.leadingWhiteSpace + 'mov.u32 ' +
+                        trace_depth_reg + ', %envreg0;\n'
                     ),
                 ]
 
@@ -5274,8 +5274,7 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
                 'setp.gt.u32 %s, %s, %u;' %
                 (overflow, next_sp, stack_capacity_bytes), whitespace),
             rtcore_continuation_make_line(
-                '@%s rt_continuation_frame_fault 1, %u, %u, %u;' %
-                (overflow, frame_kind, site, stack_frame_bytes), whitespace),
+                '@%s trap;' % overflow, whitespace),
             rtcore_continuation_make_line(
                 '@%s exit;' % overflow, whitespace),
             rtcore_continuation_make_line(
@@ -5359,20 +5358,17 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             'mov.u32 %%rt_continuation_sp, %s;' % next_sp,
             whitespace,
         ))
-        before_submit.append(rtcore_continuation_make_line(
-            'rt_continuation_frame_push %u, %u, %u, %u;' % (
-                frame_kind, site, stack_frame_bytes, stack_capacity_bytes
-            ),
-            whitespace,
-        ))
+        before_submit.append(rtcore_continuation_marker(
+            'rtcore_continuation_physical_push_complete site=%u kind=%s '
+            'frame_bytes=%u authority=local_header_and_sp' %
+            (site, kind, stack_frame_bytes), whitespace))
 
         pop_prefix = [
             rtcore_continuation_make_line(
                 'setp.lt.u32 %s, %%rt_continuation_sp, %u;' %
                 (underflow, stack_frame_bytes), whitespace),
             rtcore_continuation_make_line(
-                '@%s rt_continuation_frame_fault 2, %u, %u, %u;' %
-                (underflow, frame_kind, site, stack_frame_bytes), whitespace),
+                '@%s trap;' % underflow, whitespace),
             rtcore_continuation_make_line(
                 '@%s exit;' % underflow, whitespace),
             rtcore_continuation_make_line(
@@ -5402,9 +5398,7 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
                 'setp.ne.u32 %s, %s, %s;' %
                 (invalid_header, header_word, comparison), whitespace))
             pop_prefix.append(rtcore_continuation_make_line(
-                '@%s rt_continuation_frame_fault 3, %u, %u, %u;' %
-                (invalid_header, frame_kind, site, stack_frame_bytes),
-                whitespace))
+                '@%s trap;' % invalid_header, whitespace))
             pop_prefix.append(rtcore_continuation_make_line(
                 '@%s exit;' % invalid_header, whitespace))
         after_retire[0:0] = pop_prefix
@@ -5428,15 +5422,13 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
 
         after_retire.extend([
             rtcore_continuation_make_line(
-                'rt_continuation_frame_pop %u, %u, %u;' % (
-                    frame_kind, site, stack_frame_bytes
-                ),
-                whitespace,
-            ),
-            rtcore_continuation_make_line(
                 'mov.u32 %%rt_continuation_sp, %s;' % previous_sp,
                 whitespace,
             ),
+            rtcore_continuation_marker(
+                'rtcore_continuation_physical_pop_complete site=%u '
+                'kind=%s frame_bytes=%u authority=local_header_and_sp' %
+                (site, kind, stack_frame_bytes), whitespace),
             rtcore_continuation_marker(
                 'rtcore_continuation_pop site=%u kind=%s '
                 'frame_bytes=%u' % (site, kind, stack_frame_bytes), whitespace),
