@@ -5498,22 +5498,137 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
     return plans
 
 
+def rtcore_pipeline_continuation_depth_class(depth):
+    if depth == 0:
+        return 0
+    allocation_class = 1
+    while allocation_class < depth:
+        allocation_class *= 2
+    if allocation_class > 8:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'pipeline continuation depth %u exceeds hardware capacity 8' %
+            depth
+        )
+    return allocation_class
 
 
+def rtcore_finalize_pipeline_continuation_resources(shader_plans,
+                                                     trace_depth):
+    if not rtcore_megakernel_continuation_stack_enabled():
+        return None
+    if trace_depth <= 0 or trace_depth > 8:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'pipeline trace depth must be in [1, 8]'
+        )
 
+    max_frames = {'trace': 0, 'callable': 0, 'report': 0}
+    for _, plans in shader_plans:
+        for plan in plans:
+            max_frames[plan['kind']] = max(
+                max_frames[plan['kind']], plan['stack_frame_bytes'])
 
+    trace_limit = trace_depth if max_frames['trace'] else 0
+    # Whole-pipeline callable call-graph analysis is not available yet.
+    callable_limit = 8 if max_frames['callable'] else 0
+    report_limit = 1 if max_frames['report'] else 0
+    stack_bytes = (
+        trace_limit * max_frames['trace'] +
+        callable_limit * max_frames['callable'] +
+        report_limit * max_frames['report']
+    )
+    configured_ceiling = rtcore_continuation_stack_capacity_bytes()
+    if stack_bytes > configured_ceiling:
+        rtcore_raise_compiler_lowering_contract_violation(
+            'pipeline continuation stack requires %u bytes but configured '
+            'ceiling is %u' % (stack_bytes, configured_ceiling)
+        )
+    ccs_depth_class = rtcore_pipeline_continuation_depth_class(max(
+        trace_limit, callable_limit, report_limit
+    ))
+
+    declaration_pattern = re.compile(
+        r'^(\s*\.local \.align 8 \.b8 '
+        r'rt_continuation_stack\[)\d+(\];\s*)$'
+    )
+    overflow_pattern = re.compile(
+        r'^(\s*setp\.gt\.u32 %rt_continuation_overflow_\d+, '
+        r'%rt_continuation_next_sp_\d+, )\d+(;\s*)$'
+    )
+    for shader, plans in shader_plans:
+        if plans:
+            if stack_bytes == 0:
+                rtcore_raise_compiler_lowering_contract_violation(
+                    'lowered continuation sites require a non-zero stack'
+                )
+            for line in shader.lines:
+                full_line = declaration_pattern.sub(
+                    r'\g<1>%u\g<2>' % stack_bytes, line.fullLine)
+                full_line = overflow_pattern.sub(
+                    r'\g<1>%u\g<2>' % stack_bytes, full_line)
+                full_line = re.sub(
+                    r'stack_capacity_bytes=\d+',
+                    'stack_capacity_bytes=%u' % stack_bytes,
+                    full_line,
+                )
+                if 'rtcore_continuation_stack capacity_bytes=' in full_line:
+                    full_line = re.sub(
+                        r'capacity_bytes=\d+',
+                        'capacity_bytes=%u' % stack_bytes,
+                        full_line,
+                    )
+                line.fullLine = full_line
+            for plan in plans:
+                plan['stack_capacity_bytes'] = stack_bytes
+
+        shader.lines.append(rtcore_continuation_marker(
+            'rtcore_continuation_resource_descriptor version=1 '
+            'trace_depth=%u callable_depth=%u report_depth=%u '
+            'trace_frame_bytes=%u callable_frame_bytes=%u '
+            'report_frame_bytes=%u stack_bytes_per_lane=%u '
+            'ccs_depth_class=%u compile_time_frozen=1' % (
+                trace_limit, callable_limit, report_limit,
+                max_frames['trace'], max_frames['callable'],
+                max_frames['report'], stack_bytes, ccs_depth_class,
+            ),
+            '',
+        ))
+
+    return {
+        'version': 1,
+        'trace_depth': trace_limit,
+        'callable_depth': callable_limit,
+        'report_depth': report_limit,
+        'trace_frame_bytes': max_frames['trace'],
+        'callable_frame_bytes': max_frames['callable'],
+        'report_frame_bytes': max_frames['report'],
+        'stack_bytes_per_lane': stack_bytes,
+        'ccs_depth_class': ccs_depth_class,
+    }
 
 
 def main():
     unique_ID = 0
-    assert len(sys.argv) == 2
+    if len(sys.argv) not in (2, 4):
+        raise SystemExit(
+            'usage: ptx_lower_instructions.py SHADER_FOLDER '
+            '[--pipeline-trace-depth DEPTH]'
+        )
     shaderFolder = sys.argv[1]
+    pipeline_trace_depth = 1
+    if len(sys.argv) == 4:
+        if sys.argv[2] != '--pipeline-trace-depth':
+            raise SystemExit('unknown option %s' % sys.argv[2])
+        try:
+            pipeline_trace_depth = int(sys.argv[3], 10)
+        except ValueError:
+            raise SystemExit('pipeline trace depth must be an integer')
 
     shaders = []
     for shaderFile in os.listdir(shaderFolder):
         shaders.append(PTXShader(os.path.join(shaderFolder, shaderFile)))
     
     shaderIDs = {}
+    shader_plans = []
     for shader in shaders:
         if shader.getShaderType() in shaderIDs:
             shaderIDs[shader.getShaderType()].append(shader.getShaderID())
@@ -5556,9 +5671,13 @@ def main():
         if shader.getShaderType() == ShaderType.Ray_generation:
             add_extra_thread_return(shader)
 
-        rtcore_lower_resident_megakernel_continuations(shader)
-        
+        plans = rtcore_lower_resident_megakernel_continuations(shader)
+        shader_plans.append((shader, plans))
 
+    rtcore_finalize_pipeline_continuation_resources(
+        shader_plans, pipeline_trace_depth)
+
+    for shader in shaders:
         shader.writeToFile()
 
 

@@ -35,7 +35,6 @@
 // #include "anv_private.h"
 
 //extern void gpgpusim_init();
-extern void gpgpusim_setPipelineInfo(VkRayTracingPipelineCreateInfoKHR* pCreateInfos);
 extern void gpgpusim_setGeometries(const VkAccelerationStructureGeometryKHR* pGeometries, uint32_t geometryCount);
 extern void gpgpusim_addTreelets(VkAccelerationStructureKHR accelerationStructure);
 extern void gpgpusim_testTraversal(struct lvp_bvh_node* root);
@@ -77,6 +76,15 @@ extern void gpgpusim_vkCmdTraceRaysKHR(
                       uint64_t hit_sbt_size,
                       uint64_t callable_sbt_stride,
                       uint64_t callable_sbt_size,
+                      uint32_t continuation_descriptor_version,
+                      uint32_t continuation_trace_depth,
+                      uint32_t continuation_callable_depth,
+                      uint32_t continuation_report_depth,
+                      uint32_t continuation_trace_frame_bytes,
+                      uint32_t continuation_callable_frame_bytes,
+                      uint32_t continuation_report_frame_bytes,
+                      uint32_t continuation_stack_bytes_per_lane,
+                      uint32_t continuation_ccs_depth_class,
                       bool is_indirect,
                       uint32_t launch_width,
                       uint32_t launch_height,
@@ -107,6 +115,15 @@ extern void gpgpusim_vkCmdTraceRaysKHR_cpp(
                       uint64_t hit_sbt_size,
                       uint64_t callable_sbt_stride,
                       uint64_t callable_sbt_size,
+                      uint32_t continuation_descriptor_version,
+                      uint32_t continuation_trace_depth,
+                      uint32_t continuation_callable_depth,
+                      uint32_t continuation_report_depth,
+                      uint32_t continuation_trace_frame_bytes,
+                      uint32_t continuation_callable_frame_bytes,
+                      uint32_t continuation_report_frame_bytes,
+                      uint32_t continuation_stack_bytes_per_lane,
+                      uint32_t continuation_ccs_depth_class,
                       bool is_indirect,
                       uint32_t launch_width,
                       uint32_t launch_height,

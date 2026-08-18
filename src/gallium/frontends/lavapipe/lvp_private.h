@@ -473,6 +473,18 @@ struct lvp_pipeline_group_handle {
    uint32_t any_hit_index;
 };
 
+struct lvp_rtcore_continuation_resource_descriptor {
+   uint32_t version;
+   uint32_t trace_depth;
+   uint32_t callable_depth;
+   uint32_t report_depth;
+   uint32_t trace_frame_bytes;
+   uint32_t callable_frame_bytes;
+   uint32_t report_frame_bytes;
+   uint32_t stack_bytes_per_lane;
+   uint32_t ccs_depth_class;
+};
+
 struct lvp_inline_variant {
    uint32_t mask;
    uint32_t vals[PIPE_MAX_CONSTANT_BUFFERS][MAX_INLINABLE_UNIFORMS];
@@ -519,6 +531,8 @@ struct lvp_pipeline {
    bool used;
    uint32_t group_count;
    struct lvp_pipeline_group_handle *group_handles;
+   struct lvp_rtcore_continuation_resource_descriptor
+      rtcore_continuation_resource;
    unsigned num_groups;
    unsigned num_groups_total;
    VkPipeline groups[0];

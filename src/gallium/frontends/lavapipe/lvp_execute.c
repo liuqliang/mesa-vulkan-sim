@@ -1294,6 +1294,13 @@ static void handle_trace_ray(struct vk_cmd_queue_entry *cmd,
    printf("LVP: simulator SBT: raygen %p, miss %p, hit %p, callable %p\n",
           raygen_sbt_device_addr, miss_sbt_device_addr, hit_sbt_device_addr,
           callable_sbt_device_addr);
+   if (!state->pipeline[2] || !state->pipeline[2]->is_raytrace_pipeline) {
+      fprintf(stderr,
+              "LVP: TraceRays requires a bound ray-tracing pipeline\n");
+      abort();
+   }
+   const struct lvp_rtcore_continuation_resource_descriptor *continuation =
+      &state->pipeline[2]->rtcore_continuation_resource;
    gpgpusim_vkCmdTraceRaysKHR(
       (void *)cmd->u.trace_rays_khr.raygen_shader_binding_table->deviceAddress,
       (void *)cmd->u.trace_rays_khr.miss_shader_binding_table->deviceAddress,
@@ -1311,6 +1318,15 @@ static void handle_trace_ray(struct vk_cmd_queue_entry *cmd,
       cmd->u.trace_rays_khr.hit_shader_binding_table->size,
       cmd->u.trace_rays_khr.callable_shader_binding_table->stride,
       cmd->u.trace_rays_khr.callable_shader_binding_table->size,
+      continuation->version,
+      continuation->trace_depth,
+      continuation->callable_depth,
+      continuation->report_depth,
+      continuation->trace_frame_bytes,
+      continuation->callable_frame_bytes,
+      continuation->report_frame_bytes,
+      continuation->stack_bytes_per_lane,
+      continuation->ccs_depth_class,
       false,
       cmd->u.trace_rays_khr.width,
       cmd->u.trace_rays_khr.height,

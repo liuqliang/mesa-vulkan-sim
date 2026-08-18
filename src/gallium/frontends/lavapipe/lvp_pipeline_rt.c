@@ -43,8 +43,10 @@ vsim_khr_continuation_stack_capacity(uint32_t *capacity_out)
 static bool
 vsim_validate_compiled_continuation_stack(
    const VkRayTracingPipelineCreateInfoKHR *info,
-   char shader_paths[20][200])
+   char shader_paths[20][200],
+   struct lvp_rtcore_continuation_resource_descriptor *descriptor_out)
 {
+   memset(descriptor_out, 0, sizeof(*descriptor_out));
    const char *candidate =
       getenv("VULKAN_SIM_RTCORE_MEGAKERNEL_CONTINUATION_STACK");
    if (!candidate || strcmp(candidate, "1"))
@@ -61,6 +63,7 @@ vsim_validate_compiled_continuation_stack(
    uint32_t max_trace_frame = 0;
    uint32_t max_callable_frame = 0;
    uint32_t max_report_frame = 0;
+   bool descriptor_seen = false;
    for (uint32_t index = 0; index < info->stageCount; ++index) {
       if (!shader_paths[index][0])
          continue;
@@ -73,6 +76,42 @@ vsim_validate_compiled_continuation_stack(
       }
       char line[1024];
       while (fgets(line, sizeof(line), file)) {
+         char *descriptor_marker = strstr(
+            line, "rtcore_continuation_resource_descriptor version=");
+         if (descriptor_marker) {
+            struct lvp_rtcore_continuation_resource_descriptor parsed = {0};
+            unsigned frozen = 0;
+            if (sscanf(descriptor_marker,
+                       "rtcore_continuation_resource_descriptor version=%u "
+                       "trace_depth=%u callable_depth=%u report_depth=%u "
+                       "trace_frame_bytes=%u callable_frame_bytes=%u "
+                       "report_frame_bytes=%u stack_bytes_per_lane=%u "
+                       "ccs_depth_class=%u compile_time_frozen=%u",
+                       &parsed.version, &parsed.trace_depth,
+                       &parsed.callable_depth, &parsed.report_depth,
+                       &parsed.trace_frame_bytes,
+                       &parsed.callable_frame_bytes,
+                       &parsed.report_frame_bytes,
+                       &parsed.stack_bytes_per_lane,
+                       &parsed.ccs_depth_class, &frozen) != 10 ||
+                frozen != 1) {
+               fclose(file);
+               fprintf(stderr,
+                       "LVP: malformed compiled continuation resource "
+                       "descriptor\n");
+               return false;
+            }
+            if (!descriptor_seen) {
+               *descriptor_out = parsed;
+               descriptor_seen = true;
+            } else if (memcmp(descriptor_out, &parsed, sizeof(parsed))) {
+               fclose(file);
+               fprintf(stderr,
+                       "LVP: inconsistent continuation resource descriptors "
+                       "across pipeline shaders\n");
+               return false;
+            }
+         }
          char *marker = strstr(line, "rtcore_continuation_push site=");
          if (!marker)
             continue;
@@ -106,43 +145,66 @@ vsim_validate_compiled_continuation_stack(
       fclose(file);
    }
 
+   if (!descriptor_seen || descriptor_out->version != 1) {
+      fprintf(stderr,
+              "LVP: missing or unsupported compiled continuation resource "
+              "descriptor\n");
+      return false;
+   }
+   const uint32_t expected_trace_depth =
+      max_trace_frame ? info->maxPipelineRayRecursionDepth : 0;
+   const uint32_t expected_callable_depth =
+      max_callable_frame ? VSIM_KHR_CALLABLE_DEPTH_CAPACITY : 0;
+   const uint32_t expected_report_depth = max_report_frame ? 1 : 0;
    const uint64_t required =
-      (uint64_t)info->maxPipelineRayRecursionDepth * max_trace_frame +
-      (uint64_t)VSIM_KHR_CALLABLE_DEPTH_CAPACITY * max_callable_frame +
-      max_report_frame;
-   if (required > capacity) {
+      (uint64_t)expected_trace_depth * max_trace_frame +
+      (uint64_t)expected_callable_depth * max_callable_frame +
+      (uint64_t)expected_report_depth * max_report_frame;
+   uint32_t expected_ccs_class = 0;
+   uint32_t max_depth = MAX2(expected_trace_depth,
+                             MAX2(expected_callable_depth,
+                                  expected_report_depth));
+   if (max_depth) {
+      expected_ccs_class = 1;
+      while (expected_ccs_class < max_depth)
+         expected_ccs_class <<= 1;
+   }
+   if (required > capacity || required > UINT32_MAX ||
+       descriptor_out->trace_depth != expected_trace_depth ||
+       descriptor_out->callable_depth != expected_callable_depth ||
+       descriptor_out->report_depth != expected_report_depth ||
+       descriptor_out->trace_frame_bytes != max_trace_frame ||
+       descriptor_out->callable_frame_bytes != max_callable_frame ||
+       descriptor_out->report_frame_bytes != max_report_frame ||
+       descriptor_out->stack_bytes_per_lane != required ||
+       descriptor_out->ccs_depth_class != expected_ccs_class) {
       fprintf(stderr,
               "LVP: RTCORE_KHR_PIPELINE_STACK_CONFIG required_bytes=%llu "
               "capacity_bytes=%u trace_frame_bytes=%u trace_depth=%u "
               "callable_frame_bytes=%u callable_depth=%u "
               "report_frame_bytes=%u validated=0 "
-              "reason=aggregate_capacity_exceeded_before_execution\n",
+              "reason=compiled_descriptor_mismatch_or_capacity_exceeded\n",
               (unsigned long long)required, capacity, max_trace_frame,
-              info->maxPipelineRayRecursionDepth, max_callable_frame,
-              VSIM_KHR_CALLABLE_DEPTH_CAPACITY, max_report_frame);
-      fprintf(stderr,
-              "LVP: resident continuation pipeline requires %llu bytes "
-              "but configured per-lane capacity is %u bytes "
-              "(trace_frame=%u trace_depth=%u callable_frame=%u "
-              "callable_depth=%u report_frame=%u)\n",
-              (unsigned long long)required, capacity, max_trace_frame,
-              info->maxPipelineRayRecursionDepth, max_callable_frame,
-              VSIM_KHR_CALLABLE_DEPTH_CAPACITY, max_report_frame);
+              expected_trace_depth, max_callable_frame,
+              expected_callable_depth, max_report_frame);
       return false;
    }
    printf("LVP: RTCORE_KHR_PIPELINE_STACK_CONFIG required_bytes=%llu "
-          "capacity_bytes=%u trace_frame_bytes=%u trace_depth=%u "
+          "compile_ceiling_bytes=%u trace_frame_bytes=%u trace_depth=%u "
           "callable_frame_bytes=%u callable_depth=%u "
-          "report_frame_bytes=%u validated=1\n",
+          "report_frame_bytes=%u ccs_depth_class=%u "
+          "descriptor_version=%u compile_time_frozen=1 validated=1\n",
           (unsigned long long)required, capacity, max_trace_frame,
-          info->maxPipelineRayRecursionDepth, max_callable_frame,
-          VSIM_KHR_CALLABLE_DEPTH_CAPACITY, max_report_frame);
+          expected_trace_depth, max_callable_frame,
+          expected_callable_depth, max_report_frame,
+          descriptor_out->ccs_depth_class, descriptor_out->version);
    return true;
 }
 
 
 static bool gpgpusim_initialized = false;
 static int shader_ID = 0;
+static uint32_t rt_pipeline_ID = 0;
 
 static VkResult
 vsim_validate_ray_tracing_pipeline_capabilities(
@@ -197,7 +259,8 @@ vsim_validate_ray_tracing_pipeline_capabilities(
    return VK_SUCCESS;
 }
 
-static void translate_nir_to_ptx(nir_shader *shader, char* shaderPath)
+static void translate_nir_to_ptx(nir_shader *shader, char* shaderPath,
+                                 const char *shader_directory)
 {
    FILE *pFile;
    char *mesa_root = getenv("MESA_ROOT");
@@ -235,7 +298,8 @@ static void translate_nir_to_ptx(nir_shader *shader, char* shaderPath)
    }
 
    char fullPath[200];
-   snprintf(fullPath, sizeof(fullPath), "%s%s%s_%d%s", mesa_root, filePath, fileName, shader_ID++, extension);
+   snprintf(fullPath, sizeof(fullPath), "%s%s_%d%s", shader_directory,
+            fileName, shader_ID++, extension);
    
    char command[200];
 
@@ -245,7 +309,7 @@ static void translate_nir_to_ptx(nir_shader *shader, char* shaderPath)
       gpgpusim_initialized = true;
    }
 
-   snprintf(command, sizeof(command), "mkdir -p %s%s", mesa_root, filePath);
+   snprintf(command, sizeof(command), "mkdir -p %s", shader_directory);
    system(command);
    
    pFile = fopen (fullPath , "w");
@@ -255,13 +319,16 @@ static void translate_nir_to_ptx(nir_shader *shader, char* shaderPath)
    strcpy(shaderPath, fullPath);
 }
 
-static void run_rt_translation_passes()
+static void run_rt_translation_passes(const char *shader_directory,
+                                      uint32_t pipeline_trace_depth)
 {
    char *mesa_root = getenv("MESA_ROOT");
-   char *filePath = "gpgpusimShaders/";
 
-   char command[400];
-   snprintf(command, sizeof(command), "python3 %s/src/compiler/ptx/ptx_lower_instructions.py %s%s", mesa_root, mesa_root, filePath);
+   char command[600];
+   snprintf(command, sizeof(command),
+            "python3 %s/src/compiler/ptx/ptx_lower_instructions.py %s "
+            "--pipeline-trace-depth %u",
+            mesa_root, shader_directory, pipeline_trace_depth);
    int result = system(command);
 
    if (result != 0)
@@ -300,6 +367,10 @@ vsim_compile_ray_tracing_pipeline(
       rzalloc_array(pipeline_ctx, struct vsim_pipeline_stage, info->stageCount);
 
    char shaderPaths[20][200] = {{0}};
+   char shaderDirectory[200];
+   snprintf(shaderDirectory, sizeof(shaderDirectory),
+            "%sgpgpusimShaders/pipeline_%u/", getenv("MESA_ROOT"),
+            rt_pipeline_ID++);
    for (uint32_t i = 0; i < info->stageCount; i++) {
       printf("LVP: Compiling shader stage %d\n", i);
       const VkPipelineShaderStageCreateInfo *sinfo = &info->pStages[i];
@@ -323,7 +394,8 @@ vsim_compile_ray_tracing_pipeline(
       // Insert NIR to PTX translator here for each different ray tracing shaders, the lowered shaders under have too many intel specific intrinsics
       if(stages[i].stage >= MESA_SHADER_RAYGEN && stages[i].stage <= MESA_SHADER_CALLABLE) { // shader type from 8 to 13
          printf("LVP: Translating shader %d (type %d)\n", i, stages[i].stage);
-         translate_nir_to_ptx(stages[i].nir, shaderPaths[i]);
+         translate_nir_to_ptx(stages[i].nir, shaderPaths[i],
+                              shaderDirectory);
       }
       pipeline->shaders[i].pipeline_nir = ralloc(NULL, struct lvp_pipeline_nir);
       pipeline->shaders[i].pipeline_nir->nir = stages[i].nir;
@@ -332,9 +404,11 @@ vsim_compile_ray_tracing_pipeline(
 
    // Vulkan-Sim additions
    printf("LVP: run_rt_translation_passes\n");
-   run_rt_translation_passes();
+   run_rt_translation_passes(shaderDirectory,
+                             info->maxPipelineRayRecursionDepth);
 
-   if (!vsim_validate_compiled_continuation_stack(info, shaderPaths)) {
+   if (!vsim_validate_compiled_continuation_stack(
+          info, shaderPaths, &pipeline->rtcore_continuation_resource)) {
       ralloc_free(pipeline_ctx);
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
@@ -460,7 +534,6 @@ lvp_ray_tracing_pipeline_create(
 
    // TODO: Add VK_PIPELINE_CREATE_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR
 
-   gpgpusim_setPipelineInfo(pCreateInfo);
    *pPipeline = lvp_pipeline_to_handle(pipeline);
 
    return result;
