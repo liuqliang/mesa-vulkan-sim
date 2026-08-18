@@ -4994,6 +4994,14 @@ def rtcore_continuation_remat_candidates(
         if (
                 opcode not in RTCORE_CONTINUATION_PURE_REMAT_OPS or
                 rtcore_continuation_line_is_predicated(line) or
+                # A flat PTX register can carry a phi/back-edge value even
+                # when the definition reaching the first dynamic visit to
+                # this continuation is a cheap mov.  Cloning that mov at the
+                # resume point would restore the entry value, not the value
+                # produced by a later loop iteration.  Rematerialization is
+                # therefore legal only for registers with one definition in
+                # the entire shader, not merely one definition before this
+                # continuation site.
                 definition_counts.get(register, 0) != 1 or
                 register in region_definitions or
                 not register_dependencies.issubset(cross_live)
@@ -5185,7 +5193,11 @@ def rtcore_lower_resident_megakernel_continuations(ptx_shader):
             if not before or inside or register not in declarations:
                 continue
             reaching_defs[register] = before[-1]
-            definition_counts[register] = len(before)
+            # Use the shader-wide count as a conservative phi/back-edge
+            # guard.  The reaching definition is still the last definition
+            # before the suspension point, but any additional definition in
+            # another control-flow path makes cloning that producer unsafe.
+            definition_counts[register] = len(indices)
         cross_live = set(reaching_defs)
 
         rematerialized, dependencies = rtcore_continuation_remat_candidates(
